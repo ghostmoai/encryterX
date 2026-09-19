@@ -1,7 +1,36 @@
-# Rust build artifacts
+# Rust & C/C++ compiled binaries
 target/
 **/*.rs.bk
 *.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Binaries, PDFs and Icons
+*.pdf
+*.ico
+
+# Legacy folders and Android specs
+native/
+android/
+bin/
+buildozer.spec*
+
+# Auxiliary and legacy scripts
+copilador_v2.py
+installer.py
+limpiar_proyecto.py
+iniciar.bat
+main.py
+ui.py
+version_info.txt
+build_specification_pdf.py
+DOCUMENTO_ESTEGANOGRAFIA.md
+encryption_logic.py
+encryptor_x.py
+ejemplo_simple.py
+Licencia*.txt
 
 # Python artifacts
 __pycache__/
