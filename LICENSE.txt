@@ -1,0 +1,39 @@
+LICENCIA PÚBLICA DE USO – ENCRYPTORX
+© 2025 ghost_moia
+
+Esta licencia permite el uso público, gratuito y sin restricciones comerciales del software EncryptorX, con las siguientes condiciones:
+
+1. USO PERMITIDO
+   - Puedes usar EncryptorX en proyectos personales, educativos, creativos o en videojuegos no comerciales.
+   - Se permite su distribución siempre que se conserve esta licencia intacta.
+   - Puedes modificar el código solo para fines personales y no maliciosos.
+
+2. USO PROHIBIDO
+   - Queda totalmente prohibido utilizar EncryptorX para:
+     • Crear malware, spyware, adware u otro software malicioso.
+     • Propósitos ilegales, incluidos ciberataques, ransomware o manipulación de datos ajenos.
+     • Distribuirlo o integrarlo en sistemas de empresas sin consentimiento del autor.
+
+3. PROTECCIÓN DEL CÓDIGO
+   - Este software incluye un sistema de integridad que detecta cambios, restaura el código original y registra actividades sospechosas.
+   - Se prohíbe la manipulación del código con fines de ingeniería inversa o evasión de sus medidas de seguridad.
+
+4. ACTUALIZACIONES AUTOMÁTICAS
+   - EncryptorX verifica automáticamente nuevas versiones en GitHub.
+   - Si hay una versión más reciente, se descargará e instalará sin intervención del usuario.
+
+5. RESPONSABILIDAD LEGAL
+   - ghost_moia (el creador) no se hace responsable por daños, pérdidas, muertes o delitos cometidos con este software.
+   - En caso de uso para actos terroristas, ataques a infraestructura o actividades ilegales, toda responsabilidad recaerá en el usuario infractor.
+
+6. LICENCIA NO COMERCIAL
+   - No se permite usar EncryptorX en empresas o fines lucrativos sin autorización directa de ghost_moia.
+   - Para licencias comerciales: contactar a **EncryterX@gmail.com**
+
+7. ACCIONES LEGALES
+   - El incumplimiento de esta licencia podrá derivar en acciones legales.
+   - Está prohibido publicar este software en sitios +18, sitios no autorizados o utilizarlo para prácticas éticamente cuestionables.
+
+---
+
+AL UTILIZAR ESTE SOFTWARE, USTED ACEPTA ESTA LICENCIA EN SU TOTALIDAD.
