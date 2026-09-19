@@ -1,0 +1,43 @@
+# Este archivo define los metadatos (propiedades) que se incrustan en el archivo .exe final.
+# Su formato es técnico y específico para que la herramienta de compilación (PyInstaller) lo entienda.
+# El resultado de este archivo se puede ver haciendo clic derecho en el .exe -> Propiedades -> Detalles.
+
+# -*- coding: utf-8 -*-
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    # Versión del archivo (major, minor, build, patch). Debe coincidir con APP_VERSION en EncryptorX.py
+    filevers=(1, 2, 2, 0),
+    # Versión del producto, usualmente igual a la del archivo.
+    prodvers=(1, 2, 2, 0),
+    # Máscara de bits, 0x3f es un valor estándar que no se debe cambiar.
+    mask=0x3f,
+    # Atributos del archivo, 0x0 es el valor estándar.
+    flags=0x0,
+    # Sistema operativo de destino (0x40004 = Windows NT de 32 bits).
+    OS=0x40004,
+    # Tipo de archivo (0x1 = Aplicación .exe).
+    fileType=0x1,
+    # Subtipo de archivo (0x0 = no especificado).
+    subtype=0x0,
+    # Fecha y hora (0, 0 para que lo gestione el sistema).
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+      # Tabla de strings con la información visible para el usuario.
+      StringTable(
+        u'0c0a04b0', # Código de idioma: Español (España), codificación Unicode.
+        [StringStruct(u'CompanyName', u'el_tio_null'),
+        StringStruct(u'FileDescription', u'Herramienta de cifrado de archivos y texto.'),
+        StringStruct(u'Comments', u'Aplicación para cifrar y descifrar de forma segura. Para uso personal y no comercial. Consulte la licencia para más detalles.'),
+        StringStruct(u'FileVersion', u'1.2.2'),
+        StringStruct(u'InternalName', u'EncryptorX'),
+        StringStruct(u'LegalCopyright', u'© 2025 el_tio_null. Todos los derechos reservados.'),
+        StringStruct(u'ProductName', u'EncryptorX'),
+        StringStruct(u'ProductVersion', u'1.2.2')])
+      ]),
+    # Información de traducción.
+    VarFileInfo([VarStruct(u'Translation', [3082, 1200])]) # 3082 = Español (España), 1200 = Unicode
+  ]
+)

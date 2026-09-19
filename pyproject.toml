@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "encryptorx"
+version = "3.2.0"
+description = "Advanced Cryptography with Dual-Key Cascade Cipher, Memory-Hard Scrypt, Symbolic Wrappers, and Steganography"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "GhostMoai" }
+]
+keywords = ["cryptography", "cascade-cipher", "double-encryption", "scrypt", "steganography", "pixel-shuffling", "stream-cipher", "security"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "Pillow>=9.0.0",
+]
+
+[project.optional-dependencies]
+full = [
+    "numpy>=1.20.0",
+]
+
+[tool.setuptools]
+py-modules = ["EncryptorX"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["encryptorx*"]

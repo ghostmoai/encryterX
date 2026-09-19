@@ -1,0 +1,25 @@
+[package]
+name = "encryptorx"
+version = "3.2.0"
+edition = "2021"
+authors = ["GhostMoai / Antigravity"]
+description = "Motor criptográfico nativo Dual-Key Cascade con Scrypt, 64 Envoltorios Simbólicos y Esteganografía"
+
+[lib]
+name = "encryptorx"
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "EncryptorX"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default", "glow"] }
+rfd = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

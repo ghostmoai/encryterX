@@ -1,0 +1,55 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs and databases
+*.log
+build_log.txt
+build_verbose.log
+
+# Temporary test and key files
+*.key
+*.enc
+*.vault
+*.keyfile
+*.dec(*).txt
+test_sample.dec*
+.encryptorx_data/
+
+# IDE and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
