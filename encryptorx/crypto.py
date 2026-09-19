@@ -1,18 +1,30 @@
 """
 Core encryption / decryption logic for the encryptorx library.
 
-Uses a custom stream cipher built on SHA-256 with a 128-bit random nonce.
-Ciphertext is returned as URL-safe Base64 so it is safe to embed in JSON,
-HTML, URLs, or plain text files.
+Uses RFC 8439 ChaCha20-Poly1305 Authenticated Encryption with Associated Data (AEAD)
+with synthetic nonce derivation (SIV-like misuse resistance).
+Ciphertext is returned as URL-safe Base64 when using custom keys, or self-contained
+tokens with symbolic and numeric wrappers.
 """
 from __future__ import annotations
 
 import os
 import re
+import hmac
+import secrets
 import hashlib
 import base64
 import random
 from pathlib import Path
+
+try:
+    from .ciphers.chacha20 import (
+        ChaCha20, Poly1305, chacha20_poly1305_encrypt, chacha20_poly1305_decrypt
+    )
+except ImportError:
+    from encryptorx.ciphers.chacha20 import (
+        ChaCha20, Poly1305, chacha20_poly1305_encrypt, chacha20_poly1305_decrypt
+    )
 
 try:
     import EncryptorX as _core
@@ -29,7 +41,11 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_NONCE_SIZE = 16  # 128-bit nonce
+_NONCE_SIZE = 16  # 128-bit legacy nonce
+_AEAD_NONCE_SIZE = 12  # 96-bit RFC 8439 nonce
+_AEAD_TAG_SIZE = 16  # 128-bit Poly1305 tag
+_KEY_SIZE = 32
+FLAG_AEAD_DIRECT = 0x20
 _DEFAULT_KEY_DIR  = Path(os.path.expanduser("~")) / ".encryptorx"
 _DEFAULT_KEY_FILE = _DEFAULT_KEY_DIR / "key.key"
 SEPARATORS = ['$', '%', '&', '#', '?']
@@ -107,8 +123,17 @@ def load_key(path: str | Path | None = None) -> bytes:
 # Internal cipher primitives
 # ---------------------------------------------------------------------------
 
+def _derive_synthetic_nonce(key: bytes, plaintext: bytes) -> bytes:
+    """
+    Derive a 12-byte synthetic nonce using HMAC-SHA256 over random seed and plaintext.
+    SIV-like construction prevents nonce reuse even under RNG failure.
+    """
+    r = secrets.token_bytes(16)
+    return hmac.new(key, r + plaintext, hashlib.sha256).digest()[:12]
+
+
 def _generate_keystream(key: bytes, nonce: bytes, length: int) -> bytes:
-    """Generate a pseudo-random keystream via SHA-256 counter mode."""
+    """Generate a pseudo-random keystream via SHA-256 counter mode (legacy)."""
     keystream = b""
     counter = 0
     while len(keystream) < length:
@@ -123,18 +148,38 @@ def _xor_bytes(data: bytes, keystream: bytes) -> bytes:
 
 
 def _raw_encrypt(data: bytes, key: bytes) -> bytes:
-    nonce = os.urandom(_NONCE_SIZE)
-    ks    = _generate_keystream(key, nonce, len(data))
-    return nonce + _xor_bytes(data, ks)
+    """
+    Encrypt arbitrary bytes using RFC 8439 ChaCha20-Poly1305 AEAD with synthetic nonce.
+    Returns: 12-byte nonce + 16-byte Poly1305 tag + ciphertext.
+    """
+    nonce = _derive_synthetic_nonce(key, data)
+    ciphertext, tag = chacha20_poly1305_encrypt(key, nonce, data)
+    return nonce + tag + ciphertext
 
 
 def _raw_decrypt(data: bytes, key: bytes) -> bytes:
-    if len(data) < _NONCE_SIZE:
-        raise ValueError("Ciphertext is too short – it may be corrupted.")
-    nonce = data[:_NONCE_SIZE]
-    body  = data[_NONCE_SIZE:]
-    ks    = _generate_keystream(key, nonce, len(body))
-    return _xor_bytes(body, ks)
+    """
+    Decrypt bytes with RFC 8439 ChaCha20-Poly1305 AEAD, falling back to legacy
+    SHA-256 counter mode stream cipher for backward compatibility.
+    """
+    # 1. Try RFC 8439 ChaCha20-Poly1305 AEAD (overhead: 12-byte nonce + 16-byte tag = 28 bytes)
+    if len(data) >= _AEAD_NONCE_SIZE + _AEAD_TAG_SIZE:
+        nonce = data[:_AEAD_NONCE_SIZE]
+        tag = data[_AEAD_NONCE_SIZE:_AEAD_NONCE_SIZE + _AEAD_TAG_SIZE]
+        ciphertext = data[_AEAD_NONCE_SIZE + _AEAD_TAG_SIZE:]
+        try:
+            return chacha20_poly1305_decrypt(key, nonce, ciphertext, tag)
+        except Exception:
+            pass
+
+    # 2. Legacy fallback: 16-byte nonce + SHA-256 counter stream
+    if len(data) >= _NONCE_SIZE:
+        nonce = data[:_NONCE_SIZE]
+        body  = data[_NONCE_SIZE:]
+        ks    = _generate_keystream(key, nonce, len(body))
+        return _xor_bytes(body, ks)
+
+    raise ValueError("Ciphertext is too short – it may be corrupted.")
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +316,9 @@ def encrypt(
 ) -> str:
     """
     Encrypt a plain-text string.
-    If password is provided, uses PBKDF2-HMAC-SHA256 authenticated encryption.
-    By default, produces a self-contained Null-Obfuscated Cipher bundle.
-    If a specific key is passed, produces standard URL-safe Base64.
+    If password is provided, uses PBKDF2/Scrypt authenticated encryption.
+    By default, produces a self-contained Null-Obfuscated Cipher bundle via RFC 8439 AEAD.
+    If a specific key is passed, produces standard URL-safe Base64 using RFC 8439 AEAD.
     """
     if not text:
         return ""
@@ -289,12 +334,19 @@ def encrypt(
         delimiter = DEFAULT_SEPARATOR
     
     key_bytes = os.urandom(32)
-    key_hex = key_bytes.hex()
-    payload_bytes = _raw_encrypt(text.encode("utf-8"), key_bytes)
-    payload_hex = payload_bytes.hex()
-    
-    obf_key = _obfuscate_byte_hex_chunks(key_hex)
-    obf_payload = _obfuscate_byte_hex_chunks(payload_hex)
+    raw_key_pkg = bytes([FLAG_AEAD_DIRECT]) + key_bytes
+    pt_bytes = text.encode("utf-8")
+    nonce_bytes = _derive_synthetic_nonce(key_bytes, pt_bytes)
+    ciphertext_bytes, auth_tag = chacha20_poly1305_encrypt(
+        key_bytes, nonce_bytes, pt_bytes, associated_data=raw_key_pkg
+    )
+
+    mask = _generate_keystream(nonce_bytes, b"ENCRYPTORX_KEY_MASK", len(raw_key_pkg))
+    masked_key = _xor_bytes(raw_key_pkg, mask)
+    payload_package = nonce_bytes + auth_tag + ciphertext_bytes
+
+    obf_key = _obfuscate_byte_hex_chunks(masked_key.hex())
+    obf_payload = _obfuscate_byte_hex_chunks(payload_package.hex())
     return f"{obf_key}{delimiter}{obf_payload}"
 
 def decrypt(
@@ -306,7 +358,7 @@ def decrypt(
     """
     Decrypt a ciphertext string.
     Automatically detects Null-Obfuscated bundles and recovers embedded keys,
-    verifies HMAC tags, and uses password if protected.
+    verifies Poly1305 authentication tags, and uses password if protected.
     Fault-tolerant: recovers and shows decrypted text even if characters or info are partially lost.
     """
     if not ciphertext:
@@ -340,14 +392,37 @@ def decrypt(
             return ""
         obf_key, obf_payload = parts
         key_hex = _deobfuscate_byte_hex(obf_key)
-        if len(key_hex) != 64:
-            if strict:
-                raise ValueError(f"Corrupted key: expected 64 hex, got {len(key_hex)}.")
-            key_hex = key_hex.ljust(64, "0")[:64]
-        key_bytes = bytes.fromhex(key_hex)
         payload_hex = _deobfuscate_byte_hex(obf_payload)
+        masked_key_package = bytes.fromhex(key_hex) if key_hex else b""
         payload_bytes = bytes.fromhex(payload_hex) if payload_hex else b""
-        return _raw_decrypt(payload_bytes, key_bytes).decode("utf-8", errors="replace")
+
+        # Check AEAD format
+        if len(payload_bytes) >= _AEAD_NONCE_SIZE + _AEAD_TAG_SIZE and len(masked_key_package) >= 1 + _KEY_SIZE:
+            nonce = payload_bytes[:_AEAD_NONCE_SIZE]
+            tag = payload_bytes[_AEAD_NONCE_SIZE:_AEAD_NONCE_SIZE + _AEAD_TAG_SIZE]
+            cipher = payload_bytes[_AEAD_NONCE_SIZE + _AEAD_TAG_SIZE:]
+            mask = _generate_keystream(nonce, b"ENCRYPTORX_KEY_MASK", len(masked_key_package))
+            raw_pkg = _xor_bytes(masked_key_package, mask)
+            if raw_pkg[0] == FLAG_AEAD_DIRECT:
+                k = raw_pkg[1:1 + _KEY_SIZE]
+                try:
+                    pt = chacha20_poly1305_decrypt(k, nonce, cipher, tag, associated_data=raw_pkg)
+                    return pt.decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+
+        # Legacy fallback
+        if len(key_hex) == 64:
+            key_bytes = bytes.fromhex(key_hex)
+            return _raw_decrypt(payload_bytes, key_bytes).decode("utf-8", errors="replace")
+        elif len(payload_bytes) >= 32 and len(masked_key_package) >= 33:
+            nonce = payload_bytes[:16]
+            mask = _generate_keystream(nonce, b"ENCRYPTORX_KEY_MASK", len(masked_key_package))
+            raw_pkg = _xor_bytes(masked_key_package, mask)
+            k = raw_pkg[1:33]
+            body = payload_bytes[32:]
+            ks = _generate_keystream(k, nonce, len(body))
+            return _xor_bytes(body, ks).decode("utf-8", errors="replace")
         
     _key = _resolve_key(key)
     try:

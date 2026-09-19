@@ -40,7 +40,7 @@ from typing import Optional, Tuple, List
 # ---------------------------------------------------------------------------
 # Constantes Globales
 # ---------------------------------------------------------------------------
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 __app_name__ = "EncryptorX"
 
 SEPARATORS = ['$', '%', '&', '#']
@@ -59,6 +59,146 @@ FLAG_PBKDF2 = 0x01
 FLAG_SCRYPT = 0x02
 FLAG_DOUBLE_DIRECT = 0x10
 FLAG_DOUBLE_CASCADE = 0x12
+
+FLAG_AEAD_DIRECT = 0x20
+FLAG_AEAD_PBKDF2 = 0x21
+FLAG_AEAD_SCRYPT = 0x22
+
+AEAD_NONCE_SIZE = 12
+AEAD_TAG_SIZE = 16
+
+try:
+    from encryptorx.ciphers.chacha20 import (
+        ChaCha20, Poly1305, chacha20_poly1305_encrypt, chacha20_poly1305_decrypt
+    )
+except ImportError:
+    import struct
+
+    def _rotl32(v: int, c: int) -> int:
+        return ((v << c) & 0xFFFFFFFF) | (v >> (32 - c))
+
+    def _quarter_round(x: list[int], a: int, b: int, c: int, d: int) -> None:
+        x[a] = (x[a] + x[b]) & 0xFFFFFFFF
+        x[d] = _rotl32(x[d] ^ x[a], 16)
+        x[c] = (x[c] + x[d]) & 0xFFFFFFFF
+        x[b] = _rotl32(x[b] ^ x[c], 12)
+        x[a] = (x[a] + x[b]) & 0xFFFFFFFF
+        x[d] = _rotl32(x[d] ^ x[a], 8)
+        x[c] = (x[c] + x[d]) & 0xFFFFFFFF
+        x[b] = _rotl32(x[b] ^ x[c], 7)
+
+    class ChaCha20:
+        SIGMA = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]
+        def __init__(self, key: bytes, nonce: bytes, counter: int = 0):
+            if len(key) != 32 or len(nonce) != 12:
+                raise ValueError("Key must be 32 bytes and nonce 12 bytes.")
+            self.key = key
+            self.nonce = nonce
+            self.counter = counter & 0xFFFFFFFF
+
+        def _block(self, counter: int) -> bytes:
+            key_words = list(struct.unpack("<8I", self.key))
+            nonce_words = list(struct.unpack("<3I", self.nonce))
+            state = self.SIGMA + key_words + [counter] + nonce_words
+            working = list(state)
+            for _ in range(10):
+                _quarter_round(working, 0, 4, 8, 12)
+                _quarter_round(working, 1, 5, 9, 13)
+                _quarter_round(working, 2, 6, 10, 14)
+                _quarter_round(working, 3, 7, 11, 15)
+                _quarter_round(working, 0, 5, 10, 15)
+                _quarter_round(working, 1, 6, 11, 12)
+                _quarter_round(working, 2, 7, 8, 13)
+                _quarter_round(working, 3, 4, 9, 14)
+            for i in range(16):
+                working[i] = (working[i] + state[i]) & 0xFFFFFFFF
+            return struct.pack("<16I", *working)
+
+        def encrypt(self, data: bytes) -> bytes:
+            out = bytearray()
+            ctr = self.counter
+            for i in range(0, len(data), 64):
+                chunk = data[i:i + 64]
+                ks = self._block(ctr)
+                out.extend(b ^ k for b, k in zip(chunk, ks[:len(chunk)]))
+                ctr = (ctr + 1) & 0xFFFFFFFF
+            return bytes(out)
+
+        def decrypt(self, data: bytes) -> bytes:
+            return self.encrypt(data)
+
+    class Poly1305:
+        PRIME = (1 << 130) - 5
+        def __init__(self, key: bytes):
+            if len(key) != 32:
+                raise ValueError("Poly1305 key must be 32 bytes.")
+            r_int = int.from_bytes(key[:16], "little")
+            self.r = r_int & 0x0ffffffc0ffffffc0ffffffc0fffffff
+            self.s = int.from_bytes(key[16:], "little")
+            self.acc = 0
+
+        def update(self, data: bytes) -> None:
+            for i in range(0, len(data), 16):
+                chunk = data[i:i + 16]
+                n = int.from_bytes(chunk, "little") + (1 << (8 * len(chunk)))
+                self.acc = ((self.acc + n) * self.r) % self.PRIME
+
+        def digest(self) -> bytes:
+            tag_int = (self.acc + self.s) & ((1 << 128) - 1)
+            return tag_int.to_bytes(16, "little")
+
+    def chacha20_poly1305_encrypt(key: bytes, nonce: bytes, plaintext: bytes, associated_data: bytes = b"") -> tuple[bytes, bytes]:
+        engine = ChaCha20(key, nonce, counter=0)
+        poly_key = engine._block(0)[:32]
+        cipher_engine = ChaCha20(key, nonce, counter=1)
+        ciphertext = cipher_engine.encrypt(plaintext)
+        poly = Poly1305(poly_key)
+        if associated_data:
+            poly.update(associated_data)
+            if len(associated_data) % 16 != 0:
+                poly.update(b"\x00" * (16 - (len(associated_data) % 16)))
+        if ciphertext:
+            poly.update(ciphertext)
+            if len(ciphertext) % 16 != 0:
+                poly.update(b"\x00" * (16 - (len(ciphertext) % 16)))
+        lengths = struct.pack("<QQ", len(associated_data), len(ciphertext))
+        poly.update(lengths)
+        return ciphertext, poly.digest()
+
+    def chacha20_poly1305_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, associated_data: bytes = b"") -> bytes:
+        if len(tag) != 16:
+            raise ValueError("Invalid authentication tag length: expected 16 bytes.")
+        engine = ChaCha20(key, nonce, counter=0)
+        poly_key = engine._block(0)[:32]
+        poly = Poly1305(poly_key)
+        if associated_data:
+            poly.update(associated_data)
+            if len(associated_data) % 16 != 0:
+                poly.update(b"\x00" * (16 - (len(associated_data) % 16)))
+        if ciphertext:
+            poly.update(ciphertext)
+            if len(ciphertext) % 16 != 0:
+                poly.update(b"\x00" * (16 - (len(ciphertext) % 16)))
+        lengths = struct.pack("<QQ", len(associated_data), len(ciphertext))
+        poly.update(lengths)
+        expected_tag = poly.digest()
+        diff = 0
+        for a, b in zip(tag, expected_tag):
+            diff |= a ^ b
+        if diff != 0:
+            raise ValueError("ChaCha20-Poly1305 authentication failed: tag mismatch.")
+        cipher_engine = ChaCha20(key, nonce, counter=1)
+        return cipher_engine.decrypt(ciphertext)
+
+def _derive_synthetic_nonce(key: bytes, plaintext: bytes) -> bytes:
+    entropy = secrets.token_bytes(16)
+    return hmac.new(key, entropy + plaintext, hashlib.sha256).digest()[:12]
+
+def _is_aead_flag(f: int) -> bool:
+    return f in (FLAG_AEAD_DIRECT, FLAG_AEAD_PBKDF2, FLAG_AEAD_SCRYPT)
+
+def _is_legacy_flag(f: int) -> bool:
+    return f in (FLAG_DIRECT, FLAG_PBKDF2, FLAG_SCRYPT, FLAG_DOUBLE_DIRECT, FLAG_DOUBLE_CASCADE)
 
 # ---------------------------------------------------------------------------
 # Catálogo Ofuscado de 64 Combinaciones Simbólicas y 64 Envoltorios Legacy
@@ -255,7 +395,7 @@ def _unwrap_key_from_package(
 
     flag = raw_key_package[0]
 
-    if flag == FLAG_SCRYPT:
+    if flag in (FLAG_SCRYPT, FLAG_AEAD_SCRYPT):
         if not password:
             raise ValueError("Este mensaje requiere contraseña (blindaje Scrypt) para descifrar.")
         if len(raw_key_package) < 1 + SALT_SIZE + KEY_SIZE:
@@ -270,7 +410,7 @@ def _unwrap_key_from_package(
         )
         return _xor_bytes(enc_key, _generate_keystream(wrapping_key, salt, KEY_SIZE))
 
-    elif flag in (FLAG_PBKDF2, FLAG_DOUBLE_CASCADE):
+    elif flag in (FLAG_PBKDF2, FLAG_DOUBLE_CASCADE, FLAG_AEAD_PBKDF2):
         if not password:
             raise ValueError("Este mensaje requiere contraseña para descifrar.")
         if len(raw_key_package) < 1 + SALT_SIZE + KEY_SIZE:
@@ -286,6 +426,9 @@ def _unwrap_key_from_package(
             'sha256', password.encode('utf-8'), salt, PBKDF2_ROUNDS, dklen=KEY_SIZE
         )
         cand_key = _xor_bytes(enc_key, _generate_keystream(wrapping_key, salt, KEY_SIZE))
+        if flag == FLAG_AEAD_PBKDF2:
+            return cand_key
+
         cand_auth = _derive_auth_key(cand_key)
         cand_tag = hmac.new(
             cand_auth, raw_key_package + nonce_bytes + ciphertext_bytes, hashlib.sha256
@@ -307,7 +450,7 @@ def _unwrap_key_from_package(
 
         return cand_key
 
-    elif flag in (FLAG_DIRECT, FLAG_DOUBLE_DIRECT):
+    elif flag in (FLAG_DIRECT, FLAG_DOUBLE_DIRECT, FLAG_AEAD_DIRECT):
         if len(raw_key_package) < 1 + KEY_SIZE:
             if tolerant:
                 return raw_key_package[1:].ljust(KEY_SIZE, b"\x00")[:KEY_SIZE]
@@ -332,94 +475,19 @@ def encrypt(
     password: Optional[str] = None,
     delimiter: Optional[str] = None,
     use_scrypt: bool = True,
-    double_layer: bool = True
+    double_layer: bool = False
 ) -> str:
     """
     Cifra un texto generando un token auto-contenido con envoltorios simbólicos y numéricos.
-    Por defecto, aplica doble cifrado en cascada (Dual-Key Cascade) con Scrypt (capa interna)
-    y PBKDF2 600k (capa externa) cuando se suministra contraseña.
+    Utiliza el estándar RFC 8439 ChaCha20-Poly1305 AEAD con derivación de nonce sintético
+    resistente a colisiones y reúso de nonces (SIV-like misuse resistance).
     Si delimiter es None (por defecto), integra TODOS los separadores ($, %, &, #) en el token.
-    Si se especifica un delimiter puntual, opera en modo legacy de un solo separador.
+    Si se especifica un delimiter puntual, opera en modo de separador único.
     """
     if not text:
         return ""
 
-    if double_layer and delimiter is None:
-        # =====================================================================
-        # DOBLE CIFRADO EN CASCADA (DUAL-KEY CASCADE)
-        # =====================================================================
-        # --- CAPA 1 (Interna) ---
-        k1 = secrets.token_bytes(KEY_SIZE)
-        n1 = secrets.token_bytes(NONCE_SIZE)
-        if password:
-            salt1 = secrets.token_bytes(SALT_SIZE)
-            if use_scrypt:
-                wrap_k1 = hashlib.scrypt(
-                    password.encode('utf-8'), salt=salt1, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=KEY_SIZE
-                )
-                enc_k1 = _xor_bytes(k1, _generate_keystream(wrap_k1, salt1, KEY_SIZE))
-                raw_pkg_1 = bytes([FLAG_SCRYPT]) + salt1 + enc_k1
-            else:
-                wrap_k1 = hashlib.pbkdf2_hmac(
-                    'sha256', password.encode('utf-8'), salt1, PBKDF2_ROUNDS, dklen=KEY_SIZE
-                )
-                enc_k1 = _xor_bytes(k1, _generate_keystream(wrap_k1, salt1, KEY_SIZE))
-                raw_pkg_1 = bytes([FLAG_PBKDF2]) + salt1 + enc_k1
-        else:
-            raw_pkg_1 = bytes([FLAG_DIRECT]) + k1
-
-        pt_bytes = text.encode('utf-8')
-        ks1 = _generate_keystream(k1, n1, len(pt_bytes))
-        c1 = _xor_bytes(pt_bytes, ks1)
-        auth_k1 = _derive_auth_key(k1)
-        tag1 = hmac.new(
-            auth_k1,
-            raw_pkg_1 + n1 + c1,
-            hashlib.sha256
-        ).digest()[:TAG_SIZE]
-
-        # Inner blob encapsulado
-        inner_blob = len(raw_pkg_1).to_bytes(2, 'big') + raw_pkg_1 + n1 + tag1 + c1
-
-        # --- CAPA 2 (Externa) ---
-        k2 = secrets.token_bytes(KEY_SIZE)
-        n2 = secrets.token_bytes(NONCE_SIZE)
-        if password:
-            salt2 = secrets.token_bytes(SALT_SIZE)
-            wrap_k2 = hashlib.pbkdf2_hmac(
-                'sha256', password.encode('utf-8'), salt2, PBKDF2_ROUNDS, dklen=KEY_SIZE
-            )
-            enc_k2 = _xor_bytes(k2, _generate_keystream(wrap_k2, salt2, KEY_SIZE))
-            raw_pkg_2 = bytes([FLAG_DOUBLE_CASCADE]) + salt2 + enc_k2
-        else:
-            raw_pkg_2 = bytes([FLAG_DOUBLE_DIRECT]) + k2
-
-        ks2 = _generate_keystream(k2, n2, len(inner_blob))
-        c2 = _xor_bytes(inner_blob, ks2)
-        auth_k2 = _derive_auth_key(k2)
-        full_mac2 = hmac.new(
-            auth_k2,
-            raw_pkg_2 + n2 + c2,
-            hashlib.sha256
-        ).digest()
-        tag2 = full_mac2[:TAG_SIZE]
-        crc2 = hashlib.sha256(full_mac2).digest()[:4]
-
-        mask2 = _generate_keystream(n2, b"ENCRYPTORX_KEY_MASK", len(raw_pkg_2))
-        masked_pkg_2 = _xor_bytes(raw_pkg_2, mask2)
-
-        obf_key = _obfuscate_byte_hex(masked_pkg_2.hex())
-        obf_nonce = _obfuscate_byte_hex(n2.hex())
-        obf_tag = _obfuscate_byte_hex(tag2.hex())
-        obf_cipher = _obfuscate_byte_hex(c2.hex())
-        obf_crc = _obfuscate_byte_hex(crc2.hex())
-        return f"{obf_key}${obf_nonce}%{obf_tag}&{obf_cipher}#{obf_crc}"
-
-    # =====================================================================
-    # MODO DE CAPA ÚNICA (LEGACY O SINGLE-DELIMITER)
-    # =====================================================================
     key_bytes = secrets.token_bytes(KEY_SIZE)
-    nonce_bytes = secrets.token_bytes(NONCE_SIZE)
 
     if password:
         salt = secrets.token_bytes(SALT_SIZE)
@@ -428,27 +496,23 @@ def encrypt(
                 password.encode('utf-8'), salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=KEY_SIZE
             )
             enc_key = _xor_bytes(key_bytes, _generate_keystream(wrapping_key, salt, KEY_SIZE))
-            raw_key_package = bytes([FLAG_SCRYPT]) + salt + enc_key
+            raw_key_package = bytes([FLAG_AEAD_SCRYPT]) + salt + enc_key
         else:
             wrapping_key = hashlib.pbkdf2_hmac(
                 'sha256', password.encode('utf-8'), salt, PBKDF2_ROUNDS, dklen=KEY_SIZE
             )
             enc_key = _xor_bytes(key_bytes, _generate_keystream(wrapping_key, salt, KEY_SIZE))
-            raw_key_package = bytes([FLAG_PBKDF2]) + salt + enc_key
+            raw_key_package = bytes([FLAG_AEAD_PBKDF2]) + salt + enc_key
     else:
-        raw_key_package = bytes([FLAG_DIRECT]) + key_bytes
+        raw_key_package = bytes([FLAG_AEAD_DIRECT]) + key_bytes
 
-    plaintext_bytes = text.encode('utf-8')
-    keystream = _generate_keystream(key_bytes, nonce_bytes, len(plaintext_bytes))
-    ciphertext_bytes = _xor_bytes(plaintext_bytes, keystream)
+    pt_bytes = text.encode('utf-8')
+    nonce_bytes = _derive_synthetic_nonce(key_bytes, pt_bytes)
 
-    auth_key = _derive_auth_key(key_bytes)
-    full_mac = hmac.new(
-        auth_key,
-        raw_key_package + nonce_bytes + ciphertext_bytes,
-        hashlib.sha256
-    ).digest()
-    auth_tag = full_mac[:TAG_SIZE]
+    # Cifrado autenticado RFC 8439 ChaCha20-Poly1305 asociando raw_key_package como AAD
+    ciphertext_bytes, auth_tag = chacha20_poly1305_encrypt(
+        key_bytes, nonce_bytes, pt_bytes, associated_data=raw_key_package
+    )
 
     mask = _generate_keystream(nonce_bytes, b"ENCRYPTORX_KEY_MASK", len(raw_key_package))
     masked_key_package = _xor_bytes(raw_key_package, mask)
@@ -459,7 +523,7 @@ def encrypt(
         obf_payload = _obfuscate_byte_hex(payload_package.hex())
         return f"{obf_key}{delimiter}{obf_payload}"
     else:
-        crc = hashlib.sha256(full_mac).digest()[:4]
+        crc = hashlib.sha256(auth_tag).digest()[:4]
         obf_key = _obfuscate_byte_hex(masked_key_package.hex())
         obf_nonce = _obfuscate_byte_hex(nonce_bytes.hex())
         obf_tag = _obfuscate_byte_hex(auth_tag.hex())
@@ -471,7 +535,7 @@ def decrypt(token: str, password: Optional[str] = None, strict: bool = False) ->
     """
     Descifra un token cifrado con recuperación tolerante a fallos y pérdida de datos.
     Detecta automáticamente si es multi-separador ($, %, &, #), legacy o Base64.
-    Soporta Doble Cifrado en Cascada (Dual-Key), Scrypt, PBKDF2 (600k y 100k) y modo directo.
+    Soporta RFC 8439 ChaCha20-Poly1305 AEAD, Scrypt, PBKDF2 (600k y 100k) y tokens legacy.
     Si strict es False (por defecto), muestra el texto descifrado recuperable incluso
     si el token sufrió pérdida de caracteres, truncamiento o adulteración parcial.
     """
@@ -488,10 +552,10 @@ def decrypt(token: str, password: Optional[str] = None, strict: bool = False) ->
         p_cipher, _p_crc = rest3.split('#', 1)
 
         nonce_hex = _deobfuscate_byte_hex(p_nonce)
-        nonce_bytes = (bytes.fromhex(nonce_hex) if nonce_hex else b"").ljust(NONCE_SIZE, b"\x00")[:NONCE_SIZE]
+        raw_nonce = bytes.fromhex(nonce_hex) if nonce_hex else b""
 
         auth_tag_hex = _deobfuscate_byte_hex(p_tag)
-        auth_tag = (bytes.fromhex(auth_tag_hex) if auth_tag_hex else b"").ljust(TAG_SIZE, b"\x00")[:TAG_SIZE]
+        raw_tag = bytes.fromhex(auth_tag_hex) if auth_tag_hex else b""
 
         ciphertext_hex = _deobfuscate_byte_hex(p_cipher)
         ciphertext_bytes = bytes.fromhex(ciphertext_hex) if ciphertext_hex else b""
@@ -500,73 +564,128 @@ def decrypt(token: str, password: Optional[str] = None, strict: bool = False) ->
         if not masked_key_hex:
             raise ValueError("Clave corrupta o no encontrada en el token.")
         masked_key_package = bytes.fromhex(masked_key_hex)
-        mask = _generate_keystream(nonce_bytes, b"ENCRYPTORX_KEY_MASK", len(masked_key_package))
-        raw_key_package = _xor_bytes(masked_key_package, mask)
 
-        key_bytes = _unwrap_key_from_package(
-            raw_key_package, password, nonce_bytes, ciphertext_bytes, auth_tag, tolerant=True
-        )
+        is_aead = False
+        if len(raw_nonce) == 12:
+            test_mask = _generate_keystream(raw_nonce, b"ENCRYPTORX_KEY_MASK", 1)
+            flag = masked_key_package[0] ^ test_mask[0]
+            is_aead = _is_aead_flag(flag)
+        elif 8 <= len(raw_nonce) <= 14:
+            n12 = raw_nonce.ljust(12, b"\x00")[:12]
+            test_mask = _generate_keystream(n12, b"ENCRYPTORX_KEY_MASK", 1)
+            flag = masked_key_package[0] ^ test_mask[0]
+            is_aead = _is_aead_flag(flag)
 
-        auth_key = _derive_auth_key(key_bytes)
-        expected_tag = hmac.new(
-            auth_key,
-            raw_key_package + nonce_bytes + ciphertext_bytes,
-            hashlib.sha256
-        ).digest()[:TAG_SIZE]
-        is_mac_valid = hmac.compare_digest(auth_tag, expected_tag)
+        if is_aead:
+            nonce_bytes = raw_nonce.ljust(AEAD_NONCE_SIZE, b"\x00")[:AEAD_NONCE_SIZE]
+            auth_tag = raw_tag.ljust(AEAD_TAG_SIZE, b"\x00")[:AEAD_TAG_SIZE]
+            mask = _generate_keystream(nonce_bytes, b"ENCRYPTORX_KEY_MASK", len(masked_key_package))
+            raw_key_package = _xor_bytes(masked_key_package, mask)
 
-        if strict and not is_mac_valid:
-            flag = raw_key_package[0]
-            if flag in (FLAG_PBKDF2, FLAG_SCRYPT, FLAG_DOUBLE_CASCADE):
-                raise ValueError("Contraseña incorrecta o mensaje adulterado.")
-            else:
-                raise ValueError("Fallo de integridad HMAC o mensaje corrupto.")
+            key_bytes = _unwrap_key_from_package(
+                raw_key_package, password, nonce_bytes, ciphertext_bytes, auth_tag, tolerant=True
+            )
 
-        flag = raw_key_package[0]
-        if flag in (FLAG_DOUBLE_DIRECT, FLAG_DOUBLE_CASCADE):
-            inner_ks = _generate_keystream(key_bytes, nonce_bytes, len(ciphertext_bytes))
-            inner_blob = _xor_bytes(ciphertext_bytes, inner_ks)
-            plaintext_bytes = b""
-            if len(inner_blob) >= 2:
-                pkg1_len = int.from_bytes(inner_blob[:2], 'big')
-                if 2 + pkg1_len + NONCE_SIZE + TAG_SIZE <= len(inner_blob):
-                    offset = 2
-                    raw_pkg_1 = inner_blob[offset:offset + pkg1_len]
-                    offset += pkg1_len
-                    nonce1 = inner_blob[offset:offset + NONCE_SIZE]
-                    offset += NONCE_SIZE
-                    tag1 = inner_blob[offset:offset + TAG_SIZE]
-                    offset += TAG_SIZE
-                    c1 = inner_blob[offset:]
+            try:
+                pt_bytes = chacha20_poly1305_decrypt(
+                    key_bytes, nonce_bytes, ciphertext_bytes, auth_tag, associated_data=raw_key_package
+                )
+                return pt_bytes.decode('utf-8', errors='replace')
+            except Exception as e:
+                if raw_key_package[0] == FLAG_AEAD_PBKDF2 and password:
+                    try:
+                        salt = raw_key_package[1:1 + SALT_SIZE]
+                        enc_k = raw_key_package[1 + SALT_SIZE:1 + SALT_SIZE + KEY_SIZE]
+                        wrap_k100 = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100_000, dklen=KEY_SIZE)
+                        k100 = _xor_bytes(enc_k, _generate_keystream(wrap_k100, salt, KEY_SIZE))
+                        pt_bytes = chacha20_poly1305_decrypt(
+                            k100, nonce_bytes, ciphertext_bytes, auth_tag, associated_data=raw_key_package
+                        )
+                        return pt_bytes.decode('utf-8', errors='replace')
+                    except Exception:
+                        pass
 
-                    k1 = _unwrap_key_from_package(raw_pkg_1, password, nonce1, c1, tag1, tolerant=True)
-                    if strict:
-                        auth_k1 = _derive_auth_key(k1)
-                        expected_tag_1 = hmac.new(
-                            auth_k1, raw_pkg_1 + nonce1 + c1, hashlib.sha256
-                        ).digest()[:TAG_SIZE]
-                        if not hmac.compare_digest(tag1, expected_tag_1):
-                            raise ValueError("Fallo de integridad HMAC en capa interna.")
-                    ks1 = _generate_keystream(k1, nonce1, len(c1))
-                    plaintext_bytes = _xor_bytes(c1, ks1)
+                if strict:
+                    raise ValueError("Fallo de autenticación Poly1305 o contraseña incorrecta.") from e
+                
+                cipher_engine = ChaCha20(key_bytes, nonce_bytes, counter=1)
+                pt_lossy = cipher_engine.decrypt(ciphertext_bytes).decode('utf-8', errors='replace')
+                if raw_key_package[0] == FLAG_AEAD_DIRECT or _is_mostly_text(pt_lossy):
+                    return pt_lossy
                 else:
-                    plaintext_bytes = inner_blob[2:]
-            else:
-                plaintext_bytes = inner_blob
+                    raise ValueError("Contraseña incorrecta o mensaje no recuperable.")
 
-            plaintext = plaintext_bytes.decode('utf-8', errors='replace')
-            if not is_mac_valid and flag == FLAG_DOUBLE_CASCADE:
-                if not _is_mostly_text(plaintext):
-                    raise ValueError("Contraseña incorrecta o mensaje no recuperable.")
-            return plaintext
         else:
-            keystream = _generate_keystream(key_bytes, nonce_bytes, len(ciphertext_bytes))
-            plaintext_bytes = _xor_bytes(ciphertext_bytes, keystream)
-            plaintext = plaintext_bytes.decode('utf-8', errors='replace')
-            if not is_mac_valid and flag in (FLAG_PBKDF2, FLAG_SCRYPT):
-                if not _is_mostly_text(plaintext):
-                    raise ValueError("Contraseña incorrecta o mensaje no recuperable.")
-            return plaintext
+            # Modo Legacy Multi-Separador
+            nonce_bytes = raw_nonce.ljust(NONCE_SIZE, b"\x00")[:NONCE_SIZE]
+            auth_tag = raw_tag.ljust(TAG_SIZE, b"\x00")[:TAG_SIZE]
+            mask = _generate_keystream(nonce_bytes, b"ENCRYPTORX_KEY_MASK", len(masked_key_package))
+            raw_key_package = _xor_bytes(masked_key_package, mask)
+
+            key_bytes = _unwrap_key_from_package(
+                raw_key_package, password, nonce_bytes, ciphertext_bytes, auth_tag, tolerant=True
+            )
+
+            auth_key = _derive_auth_key(key_bytes)
+            expected_tag = hmac.new(
+                auth_key,
+                raw_key_package + nonce_bytes + ciphertext_bytes,
+                hashlib.sha256
+            ).digest()[:TAG_SIZE]
+            is_mac_valid = hmac.compare_digest(auth_tag, expected_tag)
+
+            if strict and not is_mac_valid:
+                flag = raw_key_package[0]
+                if flag in (FLAG_PBKDF2, FLAG_SCRYPT, FLAG_DOUBLE_CASCADE):
+                    raise ValueError("Contraseña incorrecta o mensaje adulterado.")
+                else:
+                    raise ValueError("Fallo de integridad HMAC o mensaje corrupto.")
+
+            flag = raw_key_package[0]
+            if flag in (FLAG_DOUBLE_DIRECT, FLAG_DOUBLE_CASCADE):
+                inner_ks = _generate_keystream(key_bytes, nonce_bytes, len(ciphertext_bytes))
+                inner_blob = _xor_bytes(ciphertext_bytes, inner_ks)
+                plaintext_bytes = b""
+                if len(inner_blob) >= 2:
+                    pkg1_len = int.from_bytes(inner_blob[:2], 'big')
+                    if 2 + pkg1_len + NONCE_SIZE + TAG_SIZE <= len(inner_blob):
+                        offset = 2
+                        raw_pkg_1 = inner_blob[offset:offset + pkg1_len]
+                        offset += pkg1_len
+                        nonce1 = inner_blob[offset:offset + NONCE_SIZE]
+                        offset += NONCE_SIZE
+                        tag1 = inner_blob[offset:offset + TAG_SIZE]
+                        offset += TAG_SIZE
+                        c1 = inner_blob[offset:]
+
+                        k1 = _unwrap_key_from_package(raw_pkg_1, password, nonce1, c1, tag1, tolerant=True)
+                        if strict:
+                            auth_k1 = _derive_auth_key(k1)
+                            expected_tag_1 = hmac.new(
+                                auth_k1, raw_pkg_1 + nonce1 + c1, hashlib.sha256
+                            ).digest()[:TAG_SIZE]
+                            if not hmac.compare_digest(tag1, expected_tag_1):
+                                raise ValueError("Fallo de integridad HMAC en capa interna.")
+                        ks1 = _generate_keystream(k1, nonce1, len(c1))
+                        plaintext_bytes = _xor_bytes(c1, ks1)
+                    else:
+                        plaintext_bytes = inner_blob[2:]
+                else:
+                    plaintext_bytes = inner_blob
+
+                plaintext = plaintext_bytes.decode('utf-8', errors='replace')
+                if not is_mac_valid and flag == FLAG_DOUBLE_CASCADE:
+                    if not _is_mostly_text(plaintext):
+                        raise ValueError("Contraseña incorrecta o mensaje no recuperable.")
+                return plaintext
+            else:
+                keystream = _generate_keystream(key_bytes, nonce_bytes, len(ciphertext_bytes))
+                plaintext_bytes = _xor_bytes(ciphertext_bytes, keystream)
+                plaintext = plaintext_bytes.decode('utf-8', errors='replace')
+                if not is_mac_valid and flag in (FLAG_PBKDF2, FLAG_SCRYPT):
+                    if not _is_mostly_text(plaintext):
+                        raise ValueError("Contraseña incorrecta o mensaje no recuperable.")
+                return plaintext
 
 
     # Detectar presencia de alguno de los separadores definidos
@@ -586,88 +705,143 @@ def decrypt(token: str, password: Optional[str] = None, strict: bool = False) ->
         # 1. Desofuscar Payload
         payload_hex = _deobfuscate_byte_hex(obf_payload)
         payload_bytes = bytes.fromhex(payload_hex) if payload_hex else b""
-        if len(payload_bytes) < (NONCE_SIZE + TAG_SIZE):
-            if strict:
-                raise ValueError("Mensaje cifrado corrupto o demasiado corto.")
-            payload_bytes = payload_bytes.ljust(NONCE_SIZE + TAG_SIZE, b"\x00")
 
-        nonce_bytes = payload_bytes[:NONCE_SIZE].ljust(NONCE_SIZE, b"\x00")[:NONCE_SIZE]
-        auth_tag = payload_bytes[NONCE_SIZE:NONCE_SIZE + TAG_SIZE].ljust(TAG_SIZE, b"\x00")[:TAG_SIZE]
-        ciphertext_bytes = payload_bytes[NONCE_SIZE + TAG_SIZE:]
-
-        # 2. Desofuscar y Desenmascarar Clave
+        # 2. Desofuscar Clave
         masked_key_hex = _deobfuscate_byte_hex(obf_key)
         if not masked_key_hex:
             raise ValueError("No se pudo extraer la sección de clave del token.")
         masked_key_package = bytes.fromhex(masked_key_hex)
 
-        mask = _generate_keystream(nonce_bytes, b"ENCRYPTORX_KEY_MASK", len(masked_key_package))
-        raw_key_package = _xor_bytes(masked_key_package, mask)
-
-        key_bytes = _unwrap_key_from_package(
-            raw_key_package, password, nonce_bytes, ciphertext_bytes, auth_tag, tolerant=True
-        )
-
-        # 3. Verificar Integridad HMAC-SHA256
-        auth_key = _derive_auth_key(key_bytes)
-        expected_tag = hmac.new(
-            auth_key,
-            raw_key_package + nonce_bytes + ciphertext_bytes,
-            hashlib.sha256
-        ).digest()[:TAG_SIZE]
-        is_mac_valid = hmac.compare_digest(auth_tag, expected_tag)
-
-        if strict and not is_mac_valid:
-            flag = raw_key_package[0]
-            if flag in (FLAG_PBKDF2, FLAG_SCRYPT, FLAG_DOUBLE_CASCADE):
-                raise ValueError("Contraseña incorrecta o mensaje adulterado.")
-            else:
-                raise ValueError("Fallo de integridad: el mensaje cifrado ha sido alterado o está corrupto.")
-
-        flag = raw_key_package[0]
-        if flag in (FLAG_DOUBLE_DIRECT, FLAG_DOUBLE_CASCADE):
-            inner_ks = _generate_keystream(key_bytes, nonce_bytes, len(ciphertext_bytes))
-            inner_blob = _xor_bytes(ciphertext_bytes, inner_ks)
-            plaintext_bytes = b""
-            if len(inner_blob) >= 2:
-                pkg1_len = int.from_bytes(inner_blob[:2], 'big')
-                if 2 + pkg1_len + NONCE_SIZE + TAG_SIZE <= len(inner_blob):
-                    offset = 2
-                    raw_pkg_1 = inner_blob[offset:offset + pkg1_len]
-                    offset += pkg1_len
-                    nonce1 = inner_blob[offset:offset + NONCE_SIZE]
-                    offset += NONCE_SIZE
-                    tag1 = inner_blob[offset:offset + TAG_SIZE]
-                    offset += TAG_SIZE
-                    c1 = inner_blob[offset:]
-
-                    k1 = _unwrap_key_from_package(raw_pkg_1, password, nonce1, c1, tag1, tolerant=True)
-                    if strict:
-                        auth_k1 = _derive_auth_key(k1)
-                        expected_tag_1 = hmac.new(auth_k1, raw_pkg_1 + nonce1 + c1, hashlib.sha256).digest()[:TAG_SIZE]
-                        if not hmac.compare_digest(tag1, expected_tag_1):
-                            raise ValueError("Fallo de integridad HMAC en capa interna.")
-                    ks1 = _generate_keystream(k1, nonce1, len(c1))
-                    plaintext_bytes = _xor_bytes(c1, ks1)
+        is_aead = False
+        if len(payload_bytes) >= AEAD_NONCE_SIZE + AEAD_TAG_SIZE:
+            mask12 = _generate_keystream(payload_bytes[:AEAD_NONCE_SIZE], b"ENCRYPTORX_KEY_MASK", 1)
+            flag12 = masked_key_package[0] ^ mask12[0]
+            if _is_aead_flag(flag12):
+                if len(payload_bytes) >= NONCE_SIZE + TAG_SIZE:
+                    mask16 = _generate_keystream(payload_bytes[:NONCE_SIZE], b"ENCRYPTORX_KEY_MASK", 1)
+                    flag16 = masked_key_package[0] ^ mask16[0]
+                    is_aead = not _is_legacy_flag(flag16)
                 else:
-                    plaintext_bytes = inner_blob[2:]
-            else:
-                plaintext_bytes = inner_blob
+                    is_aead = True
 
-            plaintext = plaintext_bytes.decode('utf-8', errors='replace')
-            if not is_mac_valid and flag in (FLAG_PBKDF2, FLAG_SCRYPT, FLAG_DOUBLE_CASCADE):
-                if not _is_mostly_text(plaintext):
+        if is_aead:
+            nonce_bytes = payload_bytes[:AEAD_NONCE_SIZE]
+            auth_tag = payload_bytes[AEAD_NONCE_SIZE:AEAD_NONCE_SIZE + AEAD_TAG_SIZE]
+            ciphertext_bytes = payload_bytes[AEAD_NONCE_SIZE + AEAD_TAG_SIZE:]
+
+            mask = _generate_keystream(nonce_bytes, b"ENCRYPTORX_KEY_MASK", len(masked_key_package))
+            raw_key_package = _xor_bytes(masked_key_package, mask)
+
+            key_bytes = _unwrap_key_from_package(
+                raw_key_package, password, nonce_bytes, ciphertext_bytes, auth_tag, tolerant=True
+            )
+
+            try:
+                pt_bytes = chacha20_poly1305_decrypt(
+                    key_bytes, nonce_bytes, ciphertext_bytes, auth_tag, associated_data=raw_key_package
+                )
+                return pt_bytes.decode('utf-8', errors='replace')
+            except Exception as e:
+                if raw_key_package[0] == FLAG_AEAD_PBKDF2 and password:
+                    try:
+                        salt = raw_key_package[1:1 + SALT_SIZE]
+                        enc_k = raw_key_package[1 + SALT_SIZE:1 + SALT_SIZE + KEY_SIZE]
+                        wrap_k100 = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100_000, dklen=KEY_SIZE)
+                        k100 = _xor_bytes(enc_k, _generate_keystream(wrap_k100, salt, KEY_SIZE))
+                        pt_bytes = chacha20_poly1305_decrypt(
+                            k100, nonce_bytes, ciphertext_bytes, auth_tag, associated_data=raw_key_package
+                        )
+                        return pt_bytes.decode('utf-8', errors='replace')
+                    except Exception:
+                        pass
+
+                if strict:
+                    raise ValueError("Fallo de autenticación Poly1305 o contraseña incorrecta.") from e
+                
+                cipher_engine = ChaCha20(key_bytes, nonce_bytes, counter=1)
+                pt_lossy = cipher_engine.decrypt(ciphertext_bytes).decode('utf-8', errors='replace')
+                if raw_key_package[0] == FLAG_AEAD_DIRECT or _is_mostly_text(pt_lossy):
+                    return pt_lossy
+                else:
                     raise ValueError("Contraseña incorrecta o mensaje no recuperable.")
-            return plaintext
+
         else:
-            keystream = _generate_keystream(key_bytes, nonce_bytes, len(ciphertext_bytes))
-            plaintext_bytes = _xor_bytes(ciphertext_bytes, keystream)
-            plaintext = plaintext_bytes.decode('utf-8', errors='replace')
-            if not is_mac_valid and flag in (FLAG_PBKDF2, FLAG_SCRYPT):
-                if not _is_mostly_text(plaintext):
-                    raise ValueError("Contraseña incorrecta o mensaje no recuperable.")
-            return plaintext
+            # Modo Legacy Separador Único
+            if len(payload_bytes) < (NONCE_SIZE + TAG_SIZE):
+                if strict:
+                    raise ValueError("Mensaje cifrado corrupto o demasiado corto.")
+                payload_bytes = payload_bytes.ljust(NONCE_SIZE + TAG_SIZE, b"\x00")
 
+            nonce_bytes = payload_bytes[:NONCE_SIZE].ljust(NONCE_SIZE, b"\x00")[:NONCE_SIZE]
+            auth_tag = payload_bytes[NONCE_SIZE:NONCE_SIZE + TAG_SIZE].ljust(TAG_SIZE, b"\x00")[:TAG_SIZE]
+            ciphertext_bytes = payload_bytes[NONCE_SIZE + TAG_SIZE:]
+
+            mask = _generate_keystream(nonce_bytes, b"ENCRYPTORX_KEY_MASK", len(masked_key_package))
+            raw_key_package = _xor_bytes(masked_key_package, mask)
+
+            key_bytes = _unwrap_key_from_package(
+                raw_key_package, password, nonce_bytes, ciphertext_bytes, auth_tag, tolerant=True
+            )
+
+            # Verificar Integridad HMAC-SHA256
+            auth_key = _derive_auth_key(key_bytes)
+            expected_tag = hmac.new(
+                auth_key,
+                raw_key_package + nonce_bytes + ciphertext_bytes,
+                hashlib.sha256
+            ).digest()[:TAG_SIZE]
+            is_mac_valid = hmac.compare_digest(auth_tag, expected_tag)
+
+            if strict and not is_mac_valid:
+                flag = raw_key_package[0]
+                if flag in (FLAG_PBKDF2, FLAG_SCRYPT, FLAG_DOUBLE_CASCADE):
+                    raise ValueError("Contraseña incorrecta o mensaje adulterado.")
+                else:
+                    raise ValueError("Fallo de integridad: el mensaje cifrado ha sido alterado o está corrupto.")
+
+            flag = raw_key_package[0]
+            if flag in (FLAG_DOUBLE_DIRECT, FLAG_DOUBLE_CASCADE):
+                inner_ks = _generate_keystream(key_bytes, nonce_bytes, len(ciphertext_bytes))
+                inner_blob = _xor_bytes(ciphertext_bytes, inner_ks)
+                plaintext_bytes = b""
+                if len(inner_blob) >= 2:
+                    pkg1_len = int.from_bytes(inner_blob[:2], 'big')
+                    if 2 + pkg1_len + NONCE_SIZE + TAG_SIZE <= len(inner_blob):
+                        offset = 2
+                        raw_pkg_1 = inner_blob[offset:offset + pkg1_len]
+                        offset += pkg1_len
+                        nonce1 = inner_blob[offset:offset + NONCE_SIZE]
+                        offset += NONCE_SIZE
+                        tag1 = inner_blob[offset:offset + TAG_SIZE]
+                        offset += TAG_SIZE
+                        c1 = inner_blob[offset:]
+
+                        k1 = _unwrap_key_from_package(raw_pkg_1, password, nonce1, c1, tag1, tolerant=True)
+                        if strict:
+                            auth_k1 = _derive_auth_key(k1)
+                            expected_tag_1 = hmac.new(auth_k1, raw_pkg_1 + nonce1 + c1, hashlib.sha256).digest()[:TAG_SIZE]
+                            if not hmac.compare_digest(tag1, expected_tag_1):
+                                raise ValueError("Fallo de integridad HMAC en capa interna.")
+                        ks1 = _generate_keystream(k1, nonce1, len(c1))
+                        plaintext_bytes = _xor_bytes(c1, ks1)
+                    else:
+                        plaintext_bytes = inner_blob[2:]
+                else:
+                    plaintext_bytes = inner_blob
+
+                plaintext = plaintext_bytes.decode('utf-8', errors='replace')
+                if not is_mac_valid and flag in (FLAG_PBKDF2, FLAG_SCRYPT, FLAG_DOUBLE_CASCADE):
+                    if not _is_mostly_text(plaintext):
+                        raise ValueError("Contraseña incorrecta o mensaje no recuperable.")
+                return plaintext
+            else:
+                keystream = _generate_keystream(key_bytes, nonce_bytes, len(ciphertext_bytes))
+                plaintext_bytes = _xor_bytes(ciphertext_bytes, keystream)
+                plaintext = plaintext_bytes.decode('utf-8', errors='replace')
+                if not is_mac_valid and flag in (FLAG_PBKDF2, FLAG_SCRYPT):
+                    if not _is_mostly_text(plaintext):
+                        raise ValueError("Contraseña incorrecta o mensaje no recuperable.")
+                return plaintext
 
     else:
         # Fallback para Base64 tradicional
@@ -697,7 +871,7 @@ def encrypt_file(
     password: Optional[str] = None
 ) -> Path:
     """
-    Cifra un archivo completo protegiendo su integridad con HMAC.
+    Cifra un archivo completo utilizando RFC 8439 ChaCha20-Poly1305 AEAD.
     
     Retorna:
         Path del archivo cifrado resultante (.enc).
@@ -712,7 +886,6 @@ def encrypt_file(
     data = src.read_bytes()
 
     key_bytes = secrets.token_bytes(KEY_SIZE)
-    nonce_bytes = secrets.token_bytes(NONCE_SIZE)
 
     if password:
         salt = secrets.token_bytes(SALT_SIZE)
@@ -720,15 +893,12 @@ def encrypt_file(
             'sha256', password.encode('utf-8'), salt, PBKDF2_ROUNDS, dklen=KEY_SIZE
         )
         enc_key = _xor_bytes(key_bytes, _generate_keystream(wrapping_key, salt, KEY_SIZE))
-        header = b"ENCX\x02\x01" + salt + enc_key
+        header = b"ENCX\x03" + bytes([FLAG_AEAD_PBKDF2]) + salt + enc_key
     else:
-        header = b"ENCX\x02\x00" + key_bytes
+        header = b"ENCX\x03" + bytes([FLAG_AEAD_DIRECT]) + key_bytes
 
-    keystream = _generate_keystream(key_bytes, nonce_bytes, len(data))
-    ciphertext = _xor_bytes(data, keystream)
-
-    auth_key = _derive_auth_key(key_bytes)
-    auth_tag = hmac.new(auth_key, header + nonce_bytes + ciphertext, hashlib.sha256).digest()[:TAG_SIZE]
+    nonce_bytes = _derive_synthetic_nonce(key_bytes, data)
+    ciphertext, auth_tag = chacha20_poly1305_encrypt(key_bytes, nonce_bytes, data, associated_data=header)
 
     final_payload = header + nonce_bytes + auth_tag + ciphertext
     dest.write_bytes(final_payload)
@@ -740,7 +910,8 @@ def decrypt_file(
     password: Optional[str] = None
 ) -> Path:
     """
-    Descifra un archivo cifrado (.enc) validando su integridad.
+    Descifra un archivo cifrado (.enc) validando su integridad y autenticidad.
+    Soporta formato v3 (RFC 8439 AEAD) y v2 (Legacy).
     
     Retorna:
         Path del archivo descifrado resultante.
@@ -750,52 +921,81 @@ def decrypt_file(
         raise FileNotFoundError(f"Archivo no encontrado: {src}")
 
     data = src.read_bytes()
-    if not data.startswith(b"ENCX\x02"):
-        raise ValueError("El archivo no tiene la cabecera válida de EncryptorX.")
+    if data.startswith(b"ENCX\x03"):
+        flag = data[5]
+        offset = 6
+        if flag in (FLAG_AEAD_PBKDF2, FLAG_AEAD_SCRYPT):
+            if not password:
+                raise ValueError("Este archivo está protegido con contraseña.")
+            salt = data[offset:offset + SALT_SIZE]
+            offset += SALT_SIZE
+            enc_key = data[offset:offset + KEY_SIZE]
+            offset += KEY_SIZE
+            wrapping_key = hashlib.pbkdf2_hmac(
+                'sha256', password.encode('utf-8'), salt, PBKDF2_ROUNDS, dklen=KEY_SIZE
+            )
+            key_bytes = _xor_bytes(enc_key, _generate_keystream(wrapping_key, salt, KEY_SIZE))
+        elif flag == FLAG_AEAD_DIRECT:
+            key_bytes = data[offset:offset + KEY_SIZE]
+            offset += KEY_SIZE
+        else:
+            raise ValueError("Formato de archivo no reconocido.")
 
-    flag = data[5]
-    offset = 6
+        header = data[:offset]
+        nonce_bytes = data[offset:offset + AEAD_NONCE_SIZE]
+        offset += AEAD_NONCE_SIZE
+        auth_tag = data[offset:offset + AEAD_TAG_SIZE]
+        offset += AEAD_TAG_SIZE
+        ciphertext = data[offset:]
 
-    if flag == 0x01:
-        if not password:
-            raise ValueError("Este archivo está protegido con contraseña.")
-        salt = data[offset:offset + SALT_SIZE]
-        offset += SALT_SIZE
-        enc_key = data[offset:offset + KEY_SIZE]
-        offset += KEY_SIZE
-        wrapping_key = hashlib.pbkdf2_hmac(
-            'sha256', password.encode('utf-8'), salt, PBKDF2_ROUNDS, dklen=KEY_SIZE
-        )
-        key_bytes = _xor_bytes(enc_key, _generate_keystream(wrapping_key, salt, KEY_SIZE))
+        try:
+            plaintext = chacha20_poly1305_decrypt(
+                key_bytes, nonce_bytes, ciphertext, auth_tag, associated_data=header
+            )
+        except Exception as e:
+            raise ValueError("Fallo de autenticación Poly1305 o contraseña incorrecta.") from e
+
+    elif data.startswith(b"ENCX\x02"):
+        flag = data[5]
+        offset = 6
+        if flag == 0x01:
+            if not password:
+                raise ValueError("Este archivo está protegido con contraseña.")
+            salt = data[offset:offset + SALT_SIZE]
+            offset += SALT_SIZE
+            enc_key = data[offset:offset + KEY_SIZE]
+            offset += KEY_SIZE
+            wrapping_key = hashlib.pbkdf2_hmac(
+                'sha256', password.encode('utf-8'), salt, PBKDF2_ROUNDS, dklen=KEY_SIZE
+            )
+            key_bytes = _xor_bytes(enc_key, _generate_keystream(wrapping_key, salt, KEY_SIZE))
+        else:
+            key_bytes = data[offset:offset + KEY_SIZE]
+            offset += KEY_SIZE
+
+        header = data[:offset]
+        nonce_bytes = data[offset:offset + NONCE_SIZE]
+        offset += NONCE_SIZE
+        auth_tag = data[offset:offset + TAG_SIZE]
+        offset += TAG_SIZE
+        ciphertext = data[offset:]
+
+        auth_key = _derive_auth_key(key_bytes)
+        expected_tag = hmac.new(auth_key, header + nonce_bytes + ciphertext, hashlib.sha256).digest()[:TAG_SIZE]
+        if not hmac.compare_digest(auth_tag, expected_tag):
+            raise ValueError("Fallo de integridad HMAC o contraseña incorrecta.")
+
+        keystream = _generate_keystream(key_bytes, nonce_bytes, len(ciphertext))
+        plaintext = _xor_bytes(ciphertext, keystream)
+
     else:
-        key_bytes = data[offset:offset + KEY_SIZE]
-        offset += KEY_SIZE
-
-    nonce_bytes = data[offset:offset + NONCE_SIZE]
-    offset += NONCE_SIZE
-    auth_tag = data[offset:offset + TAG_SIZE]
-    offset += TAG_SIZE
-    ciphertext = data[offset:]
-
-    header_len = 6 + (SALT_SIZE + KEY_SIZE if flag == 0x01 else KEY_SIZE)
-    header = data[:header_len]
-    auth_key = _derive_auth_key(key_bytes)
-    expected_tag = hmac.new(auth_key, header + nonce_bytes + ciphertext, hashlib.sha256).digest()[:TAG_SIZE]
-
-    if not hmac.compare_digest(auth_tag, expected_tag):
-        raise ValueError("Fallo de autenticación: contraseña incorrecta o archivo alterado.")
-
-    keystream = _generate_keystream(key_bytes, nonce_bytes, len(ciphertext))
-    plaintext = _xor_bytes(ciphertext, keystream)
+        raise ValueError("El archivo no tiene la cabecera válida de EncryptorX.")
 
     if output_path:
         dest = Path(output_path)
     else:
-        base_name = str(src)
-        if base_name.endswith(".enc"):
-            dest = Path(base_name[:-4])
-        else:
-            dest = Path(f"{base_name}.dec")
+        name = src.name
+        dest = src.parent / (name[:-4] if name.lower().endswith(".enc") else f"{name}.dec")
 
     # Evitar sobreescribir si ya existe
     if dest.exists():

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const VERSION: &str = "3.2.0";
+pub const VERSION: &str = "3.3.0";
 pub const SEPARATORS: [char; 4] = ['$', '%', '&', '#'];
 pub const DEFAULT_SEPARATOR: char = '$';
 pub const KEY_SIZE: usize = 32;
@@ -14,11 +14,18 @@ pub const TAG_SIZE: usize = 16;
 pub const SALT_SIZE: usize = 16;
 pub const PBKDF2_ROUNDS: u32 = 100_000;
 
+pub const AEAD_NONCE_SIZE: usize = 12;
+pub const AEAD_TAG_SIZE: usize = 16;
+
 pub const FLAG_DIRECT: u8 = 0x00;
 pub const FLAG_PBKDF2: u8 = 0x01;
 pub const FLAG_SCRYPT: u8 = 0x02;
 pub const FLAG_DOUBLE_DIRECT: u8 = 0x10;
 pub const FLAG_DOUBLE_CASCADE: u8 = 0x12;
+
+pub const FLAG_AEAD_DIRECT: u8 = 0x20;
+pub const FLAG_AEAD_PBKDF2: u8 = 0x21;
+pub const FLAG_AEAD_SCRYPT: u8 = 0x22;
 
 pub mod gui;
 pub mod ciphers;
@@ -272,6 +279,24 @@ pub fn fill_random_bytes(buf: &mut [u8]) {
     rng.fill_bytes(buf);
 }
 
+/// Deriva un nonce sintético de 96 bits (12 bytes) resistente a colisiones para ChaCha20-Poly1305.
+/// N = HMAC-SHA256(key, CSPRNG_16 || Plaintext)[0..12].
+/// Garantiza resistencia al reúso de nonces (Two-Time Pad) incluso si el CSPRNG
+/// entra en un estado degradado o repetitivo.
+pub fn derive_synthetic_nonce(key: &[u8; 32], plaintext: &[u8]) -> [u8; 12] {
+    let mut entropy = [0u8; 16];
+    fill_random_bytes(&mut entropy);
+    let mut hmac_input = Vec::with_capacity(16 + plaintext.len());
+    hmac_input.extend_from_slice(&entropy);
+    hmac_input.extend_from_slice(plaintext);
+    let full_hmac = hmac_sha256(key, &hmac_input);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&full_hmac[..12]);
+    zeroize_slice(&mut entropy);
+    zeroize_slice(&mut hmac_input);
+    nonce
+}
+
 // ---------------------------------------------------------------------------
 // Catálogo Ofuscado de 64 Combinaciones Simbólicas y 64 Envoltorios Legacy
 // Los literales de cadena se almacenan cifrados con máscara XOR y se reconstruyen
@@ -493,135 +518,55 @@ pub fn encrypt(text: &str, password: Option<&str>, delimiter: Option<char>) -> R
 }
 
 pub fn encrypt_multi(text: &str, password: Option<&str>) -> Result<String, String> {
-    // --- CAPA 1 (Interna) ---
-    let mut k1 = [0u8; KEY_SIZE];
-    fill_random_bytes(&mut k1);
-    let mut n1 = [0u8; NONCE_SIZE];
-    fill_random_bytes(&mut n1);
+    let mut key = [0u8; KEY_SIZE];
+    fill_random_bytes(&mut key);
 
-    let mut raw_pkg_1 = if let Some(pwd) = password {
-        let mut salt1 = [0u8; SALT_SIZE];
-        fill_random_bytes(&mut salt1);
-        let mut wrapping_key1 = pbkdf2_sha256(pwd, &salt1, PBKDF2_ROUNDS);
-        let mut wrap_ks1 = generate_keystream(&wrapping_key1, &salt1, KEY_SIZE);
-        let mut enc_key1 = [0u8; KEY_SIZE];
+    let mut raw_key_pkg = if let Some(pwd) = password {
+        let mut salt = [0u8; SALT_SIZE];
+        fill_random_bytes(&mut salt);
+        let mut wrapping_key = pbkdf2_sha256(pwd, &salt, PBKDF2_ROUNDS);
+        let mut wrap_ks = generate_keystream(&wrapping_key, &salt, KEY_SIZE);
+        let mut enc_key = [0u8; KEY_SIZE];
         for i in 0..KEY_SIZE {
-            enc_key1[i] = k1[i] ^ wrap_ks1[i];
+            enc_key[i] = key[i] ^ wrap_ks[i];
         }
-        zeroize_slice(&mut wrapping_key1);
-        zeroize_slice(&mut wrap_ks1);
+        zeroize_slice(&mut wrapping_key);
+        zeroize_slice(&mut wrap_ks);
 
-        let mut pkg = vec![FLAG_PBKDF2];
-        pkg.extend_from_slice(&salt1);
-        pkg.extend_from_slice(&enc_key1);
-        zeroize_slice(&mut enc_key1);
+        let mut pkg = vec![FLAG_AEAD_PBKDF2];
+        pkg.extend_from_slice(&salt);
+        pkg.extend_from_slice(&enc_key);
+        zeroize_slice(&mut enc_key);
         pkg
     } else {
-        let mut pkg = vec![FLAG_DIRECT];
-        pkg.extend_from_slice(&k1);
+        let mut pkg = vec![FLAG_AEAD_DIRECT];
+        pkg.extend_from_slice(&key);
         pkg
     };
 
     let pt_bytes = text.as_bytes();
-    let mut ks1 = generate_keystream(&k1, &n1, pt_bytes.len());
-    let mut c1 = vec![0u8; pt_bytes.len()];
-    for i in 0..pt_bytes.len() {
-        c1[i] = pt_bytes[i] ^ ks1[i];
+    let nonce = derive_synthetic_nonce(&key, pt_bytes);
+
+    // Cifrado autenticado RFC 8439 ChaCha20-Poly1305 (asociando raw_key_pkg como AAD)
+    let (ciphertext, tag) = crate::ciphers::chacha20_poly1305_encrypt(&key, &nonce, pt_bytes, &raw_key_pkg);
+    zeroize_slice(&mut key);
+
+    let mut mask = generate_keystream(&nonce, b"ENCRYPTORX_KEY_MASK", raw_key_pkg.len());
+    let mut masked_key = vec![0u8; raw_key_pkg.len()];
+    for i in 0..raw_key_pkg.len() {
+        masked_key[i] = raw_key_pkg[i] ^ mask[i];
     }
-    zeroize_slice(&mut ks1);
+    zeroize_slice(&mut mask);
+    zeroize_slice(&mut raw_key_pkg);
 
-    let mut auth_input1 = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
-    auth_input1.extend_from_slice(&k1);
-    let mut auth_key1 = sha256(&auth_input1);
-    zeroize_slice(&mut auth_input1);
-    zeroize_slice(&mut k1);
-
-    let mut mac_data1 = raw_pkg_1.clone();
-    mac_data1.extend_from_slice(&n1);
-    mac_data1.extend_from_slice(&c1);
-    let full_mac1 = hmac_sha256(&auth_key1, &mac_data1);
-    zeroize_slice(&mut auth_key1);
-    zeroize_slice(&mut mac_data1);
-    let tag1 = &full_mac1[..TAG_SIZE];
-
-    // Construcción de inner_blob encapsulado
-    let pkg1_len = raw_pkg_1.len() as u16;
-    let mut inner_blob = Vec::with_capacity(2 + raw_pkg_1.len() + NONCE_SIZE + TAG_SIZE + c1.len());
-    inner_blob.extend_from_slice(&pkg1_len.to_be_bytes());
-    inner_blob.extend_from_slice(&raw_pkg_1);
-    inner_blob.extend_from_slice(&n1);
-    inner_blob.extend_from_slice(tag1);
-    inner_blob.extend_from_slice(&c1);
-    zeroize_slice(&mut raw_pkg_1);
-
-    // --- CAPA 2 (Externa) ---
-    let mut k2 = [0u8; KEY_SIZE];
-    fill_random_bytes(&mut k2);
-    let mut n2 = [0u8; NONCE_SIZE];
-    fill_random_bytes(&mut n2);
-
-    let mut raw_pkg_2 = if let Some(pwd) = password {
-        let mut salt2 = [0u8; SALT_SIZE];
-        fill_random_bytes(&mut salt2);
-        let mut wrapping_key2 = pbkdf2_sha256(pwd, &salt2, PBKDF2_ROUNDS);
-        let mut wrap_ks2 = generate_keystream(&wrapping_key2, &salt2, KEY_SIZE);
-        let mut enc_key2 = [0u8; KEY_SIZE];
-        for i in 0..KEY_SIZE {
-            enc_key2[i] = k2[i] ^ wrap_ks2[i];
-        }
-        zeroize_slice(&mut wrapping_key2);
-        zeroize_slice(&mut wrap_ks2);
-
-        let mut pkg = vec![FLAG_DOUBLE_CASCADE];
-        pkg.extend_from_slice(&salt2);
-        pkg.extend_from_slice(&enc_key2);
-        zeroize_slice(&mut enc_key2);
-        pkg
-    } else {
-        let mut pkg = vec![FLAG_DOUBLE_DIRECT];
-        pkg.extend_from_slice(&k2);
-        pkg
-    };
-
-    let mut ks2 = generate_keystream(&k2, &n2, inner_blob.len());
-    let mut c2 = vec![0u8; inner_blob.len()];
-    for i in 0..inner_blob.len() {
-        c2[i] = inner_blob[i] ^ ks2[i];
-    }
-    zeroize_slice(&mut ks2);
-    zeroize_slice(&mut inner_blob);
-
-    let mut auth_input2 = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
-    auth_input2.extend_from_slice(&k2);
-    let mut auth_key2 = sha256(&auth_input2);
-    zeroize_slice(&mut auth_input2);
-    zeroize_slice(&mut k2);
-
-    let mut mac_data2 = raw_pkg_2.clone();
-    mac_data2.extend_from_slice(&n2);
-    mac_data2.extend_from_slice(&c2);
-    let mut full_mac2 = hmac_sha256(&auth_key2, &mac_data2);
-    zeroize_slice(&mut auth_key2);
-    zeroize_slice(&mut mac_data2);
-    let tag2 = full_mac2[..TAG_SIZE].to_vec();
-
-    let mut mask2 = generate_keystream(&n2, b"ENCRYPTORX_KEY_MASK", raw_pkg_2.len());
-    let mut masked_key = vec![0u8; raw_pkg_2.len()];
-    for i in 0..raw_pkg_2.len() {
-        masked_key[i] = raw_pkg_2[i] ^ mask2[i];
-    }
-    zeroize_slice(&mut mask2);
-    zeroize_slice(&mut raw_pkg_2);
-
-    let crc_raw = sha256(&full_mac2);
-    zeroize_slice(&mut full_mac2);
+    let crc_raw = sha256(&tag);
     let crc = &crc_raw[..4];
 
     let obf_key = obfuscate_bytes(&masked_key);
     zeroize_slice(&mut masked_key);
-    let obf_nonce = obfuscate_bytes(&n2);
-    let obf_tag = obfuscate_bytes(&tag2);
-    let obf_cipher = obfuscate_bytes(&c2);
+    let obf_nonce = obfuscate_bytes(&nonce);
+    let obf_tag = obfuscate_bytes(&tag);
+    let obf_cipher = obfuscate_bytes(&ciphertext);
     let obf_crc = obfuscate_bytes(crc);
 
     let mut out = String::with_capacity(obf_key.len() + obf_nonce.len() + obf_tag.len() + obf_cipher.len() + obf_crc.len() + 4);
@@ -646,8 +591,6 @@ pub fn encrypt_single(text: &str, password: Option<&str>, delimiter: char) -> Re
 
     let mut key = [0u8; KEY_SIZE];
     fill_random_bytes(&mut key);
-    let mut nonce = [0u8; NONCE_SIZE];
-    fill_random_bytes(&mut nonce);
 
     let mut raw_key_pkg = if let Some(pwd) = password {
         let mut salt = [0u8; SALT_SIZE];
@@ -661,39 +604,23 @@ pub fn encrypt_single(text: &str, password: Option<&str>, delimiter: char) -> Re
         zeroize_slice(&mut wrapping_key);
         zeroize_slice(&mut wrap_ks);
 
-        let mut pkg = vec![0x01];
+        let mut pkg = vec![FLAG_AEAD_PBKDF2];
         pkg.extend_from_slice(&salt);
         pkg.extend_from_slice(&enc_key);
         zeroize_slice(&mut enc_key);
         pkg
     } else {
-        let mut pkg = vec![0x00];
+        let mut pkg = vec![FLAG_AEAD_DIRECT];
         pkg.extend_from_slice(&key);
         pkg
     };
 
     let pt_bytes = text.as_bytes();
-    let mut ks = generate_keystream(&key, &nonce, pt_bytes.len());
-    let mut ciphertext = vec![0u8; pt_bytes.len()];
-    for i in 0..pt_bytes.len() {
-        ciphertext[i] = pt_bytes[i] ^ ks[i];
-    }
-    zeroize_slice(&mut ks);
+    let nonce = derive_synthetic_nonce(&key, pt_bytes);
 
-    let mut auth_input = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
-    auth_input.extend_from_slice(&key);
-    let mut auth_key = sha256(&auth_input);
-    zeroize_slice(&mut auth_input);
+    // Cifrado autenticado RFC 8439 ChaCha20-Poly1305 (asociando raw_key_pkg como AAD)
+    let (ciphertext, tag) = crate::ciphers::chacha20_poly1305_encrypt(&key, &nonce, pt_bytes, &raw_key_pkg);
     zeroize_slice(&mut key);
-
-    let mut mac_data = raw_key_pkg.clone();
-    mac_data.extend_from_slice(&nonce);
-    mac_data.extend_from_slice(&ciphertext);
-    let mut full_mac = hmac_sha256(&auth_key, &mac_data);
-    zeroize_slice(&mut auth_key);
-    zeroize_slice(&mut mac_data);
-    let auth_tag = full_mac[..TAG_SIZE].to_vec();
-    zeroize_slice(&mut full_mac);
 
     let mut mask = generate_keystream(&nonce, b"ENCRYPTORX_KEY_MASK", raw_key_pkg.len());
     let mut masked_key = vec![0u8; raw_key_pkg.len()];
@@ -706,13 +633,21 @@ pub fn encrypt_single(text: &str, password: Option<&str>, delimiter: char) -> Re
     let obf_key = obfuscate_bytes(&masked_key);
     zeroize_slice(&mut masked_key);
 
-    let mut payload = Vec::new();
+    let mut payload = Vec::with_capacity(AEAD_NONCE_SIZE + AEAD_TAG_SIZE + ciphertext.len());
     payload.extend_from_slice(&nonce);
-    payload.extend_from_slice(&auth_tag);
+    payload.extend_from_slice(&tag);
     payload.extend_from_slice(&ciphertext);
     let obf_payload = obfuscate_bytes(&payload);
 
     Ok(format!("{}{}{}", obf_key, sep, obf_payload))
+}
+
+fn is_aead_flag(f: u8) -> bool {
+    f == FLAG_AEAD_DIRECT || f == FLAG_AEAD_PBKDF2 || f == FLAG_AEAD_SCRYPT
+}
+
+fn is_legacy_flag(f: u8) -> bool {
+    f == FLAG_DIRECT || f == FLAG_PBKDF2 || f == FLAG_SCRYPT || f == FLAG_DOUBLE_DIRECT || f == FLAG_DOUBLE_CASCADE
 }
 
 fn is_mostly_text(s: &str) -> bool {
@@ -752,196 +687,288 @@ fn decrypt_multi(cleaned: &str, password: Option<&str>) -> Result<String, String
     if p4.len() != 2 { return Err("Estructura de token inválida.".to_string()); }
     let obf_cipher = p4[0];
 
-    let mut nonce = deobfuscate_bytes(obf_nonce);
-    if nonce.len() < NONCE_SIZE {
-        nonce.resize(NONCE_SIZE, 0);
-    } else {
-        nonce.truncate(NONCE_SIZE);
-    }
-
-    let mut auth_tag = deobfuscate_bytes(obf_tag);
-    if auth_tag.len() < TAG_SIZE {
-        auth_tag.resize(TAG_SIZE, 0);
-    } else {
-        auth_tag.truncate(TAG_SIZE);
-    }
-
+    let raw_nonce = deobfuscate_bytes(obf_nonce);
+    let raw_tag = deobfuscate_bytes(obf_tag);
     let ciphertext = deobfuscate_bytes(obf_cipher);
 
     let mut masked_key = deobfuscate_bytes(obf_key);
     if masked_key.is_empty() {
         return Err("Estructura de clave dañada o ilegible.".to_string());
     }
-    if masked_key.len() < 1 + KEY_SIZE {
-        masked_key.resize(1 + KEY_SIZE, 0);
-    }
 
-    let mut mask = generate_keystream(&nonce, b"ENCRYPTORX_KEY_MASK", masked_key.len());
-    let mut raw_key_pkg = vec![0u8; masked_key.len()];
-    for i in 0..masked_key.len() {
-        raw_key_pkg[i] = masked_key[i] ^ mask[i];
-    }
-    zeroize_slice(&mut mask);
-    zeroize_slice(&mut masked_key);
-
-    let flag = raw_key_pkg[0];
-    let mut key: [u8; KEY_SIZE] = if flag == FLAG_PBKDF2 || flag == FLAG_DOUBLE_CASCADE {
-        let pwd = match password {
-            Some(p) => p,
-            None => {
-                zeroize_slice(&mut raw_key_pkg);
-                return Err("Este mensaje requiere contraseña para descifrar".to_string());
-            }
-        };
-        if raw_key_pkg.len() < 1 + SALT_SIZE + KEY_SIZE {
-            raw_key_pkg.resize(1 + SALT_SIZE + KEY_SIZE, 0);
-        }
-        let salt = &raw_key_pkg[1..1 + SALT_SIZE];
-        let enc_key = &raw_key_pkg[1 + SALT_SIZE..1 + SALT_SIZE + KEY_SIZE];
-        let mut wrapping_key = pbkdf2_sha256(pwd, salt, PBKDF2_ROUNDS);
-        let mut wrap_ks = generate_keystream(&wrapping_key, salt, KEY_SIZE);
-        let mut k = [0u8; KEY_SIZE];
-        for i in 0..KEY_SIZE {
-            k[i] = enc_key[i] ^ wrap_ks[i];
-        }
-        zeroize_slice(&mut wrapping_key);
-        zeroize_slice(&mut wrap_ks);
-        k
+    // Comprobar si el token utiliza el estándar AEAD ChaCha20-Poly1305 (nonce de 12 bytes y flag AEAD)
+    let is_aead = if raw_nonce.len() == 12 {
+        let test_mask = generate_keystream(&raw_nonce, b"ENCRYPTORX_KEY_MASK", 1);
+        let flag = masked_key[0] ^ test_mask[0];
+        is_aead_flag(flag)
+    } else if raw_nonce.len() <= 14 && raw_nonce.len() >= 8 {
+        let mut n12 = [0u8; 12];
+        let clen = std::cmp::min(12, raw_nonce.len());
+        n12[..clen].copy_from_slice(&raw_nonce[..clen]);
+        let test_mask = generate_keystream(&n12, b"ENCRYPTORX_KEY_MASK", 1);
+        let flag = masked_key[0] ^ test_mask[0];
+        is_aead_flag(flag)
     } else {
-        let mut k = [0u8; KEY_SIZE];
-        let copy_len = std::cmp::min(KEY_SIZE, raw_key_pkg.len() - 1);
-        k[..copy_len].copy_from_slice(&raw_key_pkg[1..1 + copy_len]);
-        k
+        false
     };
 
-    // Verificar HMAC
-    let mut auth_input = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
-    auth_input.extend_from_slice(&key);
-    let mut auth_key = sha256(&auth_input);
-    zeroize_slice(&mut auth_input);
+    if is_aead {
+        let mut nonce = [0u8; 12];
+        let copy_len = std::cmp::min(12, raw_nonce.len());
+        nonce[..copy_len].copy_from_slice(&raw_nonce[..copy_len]);
 
-    let mut mac_data = raw_key_pkg.clone();
-    mac_data.extend_from_slice(&nonce);
-    mac_data.extend_from_slice(&ciphertext);
-    let mut full_mac = hmac_sha256(&auth_key, &mac_data);
-    zeroize_slice(&mut auth_key);
-    zeroize_slice(&mut mac_data);
-    zeroize_slice(&mut raw_key_pkg);
-    let expected_mac = &full_mac[..TAG_SIZE];
+        let mut tag = [0u8; 16];
+        let copy_tag_len = std::cmp::min(16, raw_tag.len());
+        tag[..copy_tag_len].copy_from_slice(&raw_tag[..copy_tag_len]);
 
-    let mut diff = 0u8;
-    for i in 0..TAG_SIZE {
-        diff |= auth_tag[i] ^ expected_mac[i];
-    }
-    zeroize_slice(&mut full_mac);
-    let is_mac_valid = diff == 0;
-
-    if flag == FLAG_DOUBLE_DIRECT || flag == FLAG_DOUBLE_CASCADE {
-        let mut ks2 = generate_keystream(&key, &nonce, ciphertext.len());
-        zeroize_slice(&mut key);
-        let mut inner_blob = vec![0u8; ciphertext.len()];
-        for i in 0..ciphertext.len() {
-            inner_blob[i] = ciphertext[i] ^ ks2[i];
+        let mut mask = generate_keystream(&nonce, b"ENCRYPTORX_KEY_MASK", masked_key.len());
+        let mut raw_key_pkg = vec![0u8; masked_key.len()];
+        for i in 0..masked_key.len() {
+            raw_key_pkg[i] = masked_key[i] ^ mask[i];
         }
-        zeroize_slice(&mut ks2);
+        zeroize_slice(&mut mask);
+        zeroize_slice(&mut masked_key);
 
-        if inner_blob.len() < 2 + 1 + KEY_SIZE + NONCE_SIZE + TAG_SIZE {
-            let pt_lossy = String::from_utf8_lossy(&inner_blob).into_owned();
-            zeroize_slice(&mut inner_blob);
-            if !is_mac_valid && flag == FLAG_DOUBLE_CASCADE && !is_mostly_text(&pt_lossy) {
-                return Err("Fallo de integridad HMAC o contraseña incorrecta".to_string());
-            }
-            return Ok(pt_lossy);
-        }
-
-        let pkg1_len = u16::from_be_bytes([inner_blob[0], inner_blob[1]]) as usize;
-        if inner_blob.len() < 2 + pkg1_len + NONCE_SIZE + TAG_SIZE {
-            let pt_lossy = String::from_utf8_lossy(&inner_blob[2..]).into_owned();
-            zeroize_slice(&mut inner_blob);
-            if !is_mac_valid && flag == FLAG_DOUBLE_CASCADE && !is_mostly_text(&pt_lossy) {
-                return Err("Fallo de integridad HMAC o contraseña incorrecta".to_string());
-            }
-            return Ok(pt_lossy);
-        }
-
-        let offset_pkg = 2;
-        let raw_pkg_1 = &inner_blob[offset_pkg..offset_pkg + pkg1_len];
-        let offset_nonce = offset_pkg + pkg1_len;
-        let nonce1 = &inner_blob[offset_nonce..offset_nonce + NONCE_SIZE];
-        let offset_tag = offset_nonce + NONCE_SIZE;
-        let _tag1 = &inner_blob[offset_tag..offset_tag + TAG_SIZE];
-        let offset_c1 = offset_tag + TAG_SIZE;
-        let c1 = &inner_blob[offset_c1..];
-
-        let flag1 = raw_pkg_1[0];
-        let mut k1: [u8; KEY_SIZE] = if flag1 == FLAG_PBKDF2 {
+        let flag = raw_key_pkg[0];
+        let mut key: [u8; KEY_SIZE] = if flag == FLAG_AEAD_PBKDF2 || flag == FLAG_AEAD_SCRYPT {
             let pwd = match password {
                 Some(p) => p,
                 None => {
-                    zeroize_slice(&mut inner_blob);
-                    return Err("La capa interna requiere contraseña".to_string());
+                    zeroize_slice(&mut raw_key_pkg);
+                    return Err("Este mensaje requiere contraseña para descifrar".to_string());
                 }
             };
-            if raw_pkg_1.len() < 1 + SALT_SIZE + KEY_SIZE {
-                zeroize_slice(&mut inner_blob);
-                return Err("Clave interna dañada".to_string());
+            if raw_key_pkg.len() < 1 + SALT_SIZE + KEY_SIZE {
+                raw_key_pkg.resize(1 + SALT_SIZE + KEY_SIZE, 0);
             }
-            let salt1 = &raw_pkg_1[1..1 + SALT_SIZE];
-            let enc_k1 = &raw_pkg_1[1 + SALT_SIZE..1 + SALT_SIZE + KEY_SIZE];
-            let mut wrapping_key1 = pbkdf2_sha256(pwd, salt1, PBKDF2_ROUNDS);
-            let mut wrap_ks1 = generate_keystream(&wrapping_key1, salt1, KEY_SIZE);
+            let salt = &raw_key_pkg[1..1 + SALT_SIZE];
+            let enc_key = &raw_key_pkg[1 + SALT_SIZE..1 + SALT_SIZE + KEY_SIZE];
+            let mut wrapping_key = pbkdf2_sha256(pwd, salt, PBKDF2_ROUNDS);
+            let mut wrap_ks = generate_keystream(&wrapping_key, salt, KEY_SIZE);
             let mut k = [0u8; KEY_SIZE];
             for i in 0..KEY_SIZE {
-                k[i] = enc_k1[i] ^ wrap_ks1[i];
+                k[i] = enc_key[i] ^ wrap_ks[i];
             }
-            zeroize_slice(&mut wrapping_key1);
-            zeroize_slice(&mut wrap_ks1);
+            zeroize_slice(&mut wrapping_key);
+            zeroize_slice(&mut wrap_ks);
             k
         } else {
             let mut k = [0u8; KEY_SIZE];
-            let copy_len = std::cmp::min(KEY_SIZE, raw_pkg_1.len() - 1);
-            k[..copy_len].copy_from_slice(&raw_pkg_1[1..1 + copy_len]);
+            let copy_k_len = std::cmp::min(KEY_SIZE, if raw_key_pkg.len() > 1 { raw_key_pkg.len() - 1 } else { 0 });
+            if copy_k_len > 0 {
+                k[..copy_k_len].copy_from_slice(&raw_key_pkg[1..1 + copy_k_len]);
+            }
             k
         };
 
-        let mut ks1 = generate_keystream(&k1, nonce1, c1.len());
-        zeroize_slice(&mut k1);
+        let dec_result = crate::ciphers::chacha20_poly1305_decrypt(&key, &nonce, &ciphertext, &tag, &raw_key_pkg);
+        zeroize_slice(&mut raw_key_pkg);
 
-        let mut pt = vec![0u8; c1.len()];
-        for i in 0..c1.len() {
-            pt[i] = c1[i] ^ ks1[i];
-        }
-        zeroize_slice(&mut ks1);
-        zeroize_slice(&mut inner_blob);
-
-        let pt_str = String::from_utf8_lossy(&pt).into_owned();
-        zeroize_slice(&mut pt);
-
-        if !is_mac_valid && flag == FLAG_DOUBLE_CASCADE {
-            if !is_mostly_text(&pt_str) {
-                return Err("Fallo de integridad HMAC o contraseña incorrecta".to_string());
+        match dec_result {
+            Ok(pt_bytes) => {
+                zeroize_slice(&mut key);
+                Ok(String::from_utf8_lossy(&pt_bytes).into_owned())
+            }
+            Err(_) => {
+                // Recuperación tolerante a fallos / pérdida de caracteres
+                let cipher_engine = crate::ciphers::ChaCha20::new(&key, &nonce, 1);
+                zeroize_slice(&mut key);
+                let pt_raw = cipher_engine.decrypt(&ciphertext);
+                let pt_str = String::from_utf8_lossy(&pt_raw).into_owned();
+                if flag == FLAG_AEAD_DIRECT || is_mostly_text(&pt_str) {
+                    Ok(pt_str)
+                } else {
+                    Err("Fallo de autenticación Poly1305 o contraseña incorrecta".to_string())
+                }
             }
         }
-        Ok(pt_str)
     } else {
-        let mut ks = generate_keystream(&key, &nonce, ciphertext.len());
-        zeroize_slice(&mut key);
-
-        let mut pt = vec![0u8; ciphertext.len()];
-        for i in 0..ciphertext.len() {
-            pt[i] = ciphertext[i] ^ ks[i];
+        // --- MODO LEGACY MULTI-SEPARADOR ---
+        let mut nonce = raw_nonce;
+        if nonce.len() < NONCE_SIZE {
+            nonce.resize(NONCE_SIZE, 0);
+        } else {
+            nonce.truncate(NONCE_SIZE);
         }
-        zeroize_slice(&mut ks);
 
-        let pt_str = String::from_utf8_lossy(&pt).into_owned();
-        zeroize_slice(&mut pt);
+        let mut auth_tag = raw_tag;
+        if auth_tag.len() < TAG_SIZE {
+            auth_tag.resize(TAG_SIZE, 0);
+        } else {
+            auth_tag.truncate(TAG_SIZE);
+        }
 
-        if !is_mac_valid && (flag == FLAG_PBKDF2 || flag == FLAG_SCRYPT) {
-            if !is_mostly_text(&pt_str) {
-                return Err("Fallo de integridad HMAC o contraseña incorrecta".to_string());
+        if masked_key.len() < 1 + KEY_SIZE {
+            masked_key.resize(1 + KEY_SIZE, 0);
+        }
+
+        let mut mask = generate_keystream(&nonce, b"ENCRYPTORX_KEY_MASK", masked_key.len());
+        let mut raw_key_pkg = vec![0u8; masked_key.len()];
+        for i in 0..masked_key.len() {
+            raw_key_pkg[i] = masked_key[i] ^ mask[i];
+        }
+        zeroize_slice(&mut mask);
+        zeroize_slice(&mut masked_key);
+
+        let flag = raw_key_pkg[0];
+        let mut key: [u8; KEY_SIZE] = if flag == FLAG_PBKDF2 || flag == FLAG_DOUBLE_CASCADE {
+            let pwd = match password {
+                Some(p) => p,
+                None => {
+                    zeroize_slice(&mut raw_key_pkg);
+                    return Err("Este mensaje requiere contraseña para descifrar".to_string());
+                }
+            };
+            if raw_key_pkg.len() < 1 + SALT_SIZE + KEY_SIZE {
+                raw_key_pkg.resize(1 + SALT_SIZE + KEY_SIZE, 0);
             }
+            let salt = &raw_key_pkg[1..1 + SALT_SIZE];
+            let enc_key = &raw_key_pkg[1 + SALT_SIZE..1 + SALT_SIZE + KEY_SIZE];
+            let mut wrapping_key = pbkdf2_sha256(pwd, salt, PBKDF2_ROUNDS);
+            let mut wrap_ks = generate_keystream(&wrapping_key, salt, KEY_SIZE);
+            let mut k = [0u8; KEY_SIZE];
+            for i in 0..KEY_SIZE {
+                k[i] = enc_key[i] ^ wrap_ks[i];
+            }
+            zeroize_slice(&mut wrapping_key);
+            zeroize_slice(&mut wrap_ks);
+            k
+        } else {
+            let mut k = [0u8; KEY_SIZE];
+            let copy_len = std::cmp::min(KEY_SIZE, raw_key_pkg.len() - 1);
+            k[..copy_len].copy_from_slice(&raw_key_pkg[1..1 + copy_len]);
+            k
+        };
+
+        // Verificar HMAC
+        let mut auth_input = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
+        auth_input.extend_from_slice(&key);
+        let mut auth_key = sha256(&auth_input);
+        zeroize_slice(&mut auth_input);
+
+        let mut mac_data = raw_key_pkg.clone();
+        mac_data.extend_from_slice(&nonce);
+        mac_data.extend_from_slice(&ciphertext);
+        let mut full_mac = hmac_sha256(&auth_key, &mac_data);
+        zeroize_slice(&mut auth_key);
+        zeroize_slice(&mut mac_data);
+        zeroize_slice(&mut raw_key_pkg);
+        let expected_mac = &full_mac[..TAG_SIZE];
+
+        let mut diff = 0u8;
+        for i in 0..TAG_SIZE {
+            diff |= auth_tag[i] ^ expected_mac[i];
         }
-        Ok(pt_str)
+        zeroize_slice(&mut full_mac);
+        let is_mac_valid = diff == 0;
+
+        if flag == FLAG_DOUBLE_DIRECT || flag == FLAG_DOUBLE_CASCADE {
+            let mut ks2 = generate_keystream(&key, &nonce, ciphertext.len());
+            zeroize_slice(&mut key);
+            let mut inner_blob = vec![0u8; ciphertext.len()];
+            for i in 0..ciphertext.len() {
+                inner_blob[i] = ciphertext[i] ^ ks2[i];
+            }
+            zeroize_slice(&mut ks2);
+
+            if inner_blob.len() < 2 + 1 + KEY_SIZE + NONCE_SIZE + TAG_SIZE {
+                let pt_lossy = String::from_utf8_lossy(&inner_blob).into_owned();
+                zeroize_slice(&mut inner_blob);
+                if !is_mac_valid && flag == FLAG_DOUBLE_CASCADE && !is_mostly_text(&pt_lossy) {
+                    return Err("Fallo de integridad HMAC o contraseña incorrecta".to_string());
+                }
+                return Ok(pt_lossy);
+            }
+
+            let pkg1_len = u16::from_be_bytes([inner_blob[0], inner_blob[1]]) as usize;
+            if inner_blob.len() < 2 + pkg1_len + NONCE_SIZE + TAG_SIZE {
+                let pt_lossy = String::from_utf8_lossy(&inner_blob[2..]).into_owned();
+                zeroize_slice(&mut inner_blob);
+                if !is_mac_valid && flag == FLAG_DOUBLE_CASCADE && !is_mostly_text(&pt_lossy) {
+                    return Err("Fallo de integridad HMAC o contraseña incorrecta".to_string());
+                }
+                return Ok(pt_lossy);
+            }
+
+            let offset_pkg = 2;
+            let raw_pkg_1 = &inner_blob[offset_pkg..offset_pkg + pkg1_len];
+            let offset_nonce = offset_pkg + pkg1_len;
+            let nonce1 = &inner_blob[offset_nonce..offset_nonce + NONCE_SIZE];
+            let offset_tag = offset_nonce + NONCE_SIZE;
+            let _tag1 = &inner_blob[offset_tag..offset_tag + TAG_SIZE];
+            let offset_c1 = offset_tag + TAG_SIZE;
+            let c1 = &inner_blob[offset_c1..];
+
+            let flag1 = raw_pkg_1[0];
+            let mut k1: [u8; KEY_SIZE] = if flag1 == FLAG_PBKDF2 {
+                let pwd = match password {
+                    Some(p) => p,
+                    None => {
+                        zeroize_slice(&mut inner_blob);
+                        return Err("La capa interna requiere contraseña".to_string());
+                    }
+                };
+                if raw_pkg_1.len() < 1 + SALT_SIZE + KEY_SIZE {
+                    zeroize_slice(&mut inner_blob);
+                    return Err("Clave interna dañada".to_string());
+                }
+                let salt1 = &raw_pkg_1[1..1 + SALT_SIZE];
+                let enc_k1 = &raw_pkg_1[1 + SALT_SIZE..1 + SALT_SIZE + KEY_SIZE];
+                let mut wrapping_key1 = pbkdf2_sha256(pwd, salt1, PBKDF2_ROUNDS);
+                let mut wrap_ks1 = generate_keystream(&wrapping_key1, salt1, KEY_SIZE);
+                let mut k = [0u8; KEY_SIZE];
+                for i in 0..KEY_SIZE {
+                    k[i] = enc_k1[i] ^ wrap_ks1[i];
+                }
+                zeroize_slice(&mut wrapping_key1);
+                zeroize_slice(&mut wrap_ks1);
+                k
+            } else {
+                let mut k = [0u8; KEY_SIZE];
+                let copy_len = std::cmp::min(KEY_SIZE, raw_pkg_1.len() - 1);
+                k[..copy_len].copy_from_slice(&raw_pkg_1[1..1 + copy_len]);
+                k
+            };
+
+            let mut ks1 = generate_keystream(&k1, nonce1, c1.len());
+            zeroize_slice(&mut k1);
+
+            let mut pt = vec![0u8; c1.len()];
+            for i in 0..c1.len() {
+                pt[i] = c1[i] ^ ks1[i];
+            }
+            zeroize_slice(&mut ks1);
+            zeroize_slice(&mut inner_blob);
+
+            let pt_str = String::from_utf8_lossy(&pt).into_owned();
+            zeroize_slice(&mut pt);
+
+            if !is_mac_valid && flag == FLAG_DOUBLE_CASCADE {
+                if !is_mostly_text(&pt_str) {
+                    return Err("Fallo de integridad HMAC o contraseña incorrecta".to_string());
+                }
+            }
+            Ok(pt_str)
+        } else {
+            let mut ks = generate_keystream(&key, &nonce, ciphertext.len());
+            zeroize_slice(&mut key);
+
+            let mut pt = vec![0u8; ciphertext.len()];
+            for i in 0..ciphertext.len() {
+                pt[i] = ciphertext[i] ^ ks[i];
+            }
+            zeroize_slice(&mut ks);
+
+            let pt_str = String::from_utf8_lossy(&pt).into_owned();
+            zeroize_slice(&mut pt);
+
+            if !is_mac_valid && (flag == FLAG_PBKDF2 || flag == FLAG_SCRYPT) {
+                if !is_mostly_text(&pt_str) {
+                    return Err("Fallo de integridad HMAC o contraseña incorrecta".to_string());
+                }
+            }
+            Ok(pt_str)
+        }
     }
 }
 
@@ -966,100 +993,193 @@ fn decrypt_single(cleaned: &str, password: Option<&str>) -> Result<String, Strin
 
     let (obf_key, obf_payload) = (parts[0], parts[1]);
     let mut payload = deobfuscate_bytes(obf_payload);
-    if payload.len() < NONCE_SIZE + TAG_SIZE {
-        payload.resize(NONCE_SIZE + TAG_SIZE, 0);
-    }
-
-    let nonce = &payload[..NONCE_SIZE];
-    let auth_tag = &payload[NONCE_SIZE..NONCE_SIZE + TAG_SIZE];
-    let ciphertext = &payload[NONCE_SIZE + TAG_SIZE..];
-
     let mut masked_key = deobfuscate_bytes(obf_key);
     if masked_key.is_empty() {
         return Err("Estructura de clave dañada o ilegible.".to_string());
     }
-    if masked_key.len() < 1 + KEY_SIZE {
-        masked_key.resize(1 + KEY_SIZE, 0);
-    }
 
-    let mut mask = generate_keystream(nonce, b"ENCRYPTORX_KEY_MASK", masked_key.len());
-    let mut raw_key_pkg = vec![0u8; masked_key.len()];
-    for i in 0..masked_key.len() {
-        raw_key_pkg[i] = masked_key[i] ^ mask[i];
-    }
-    zeroize_slice(&mut mask);
-    zeroize_slice(&mut masked_key);
-
-    let flag = raw_key_pkg[0];
-    let mut key: [u8; KEY_SIZE] = if flag == 0x01 {
-        let pwd = match password {
-            Some(p) => p,
-            None => {
-                zeroize_slice(&mut raw_key_pkg);
-                return Err("Este mensaje requiere contraseña para descifrar".to_string());
+    // Comprobar si el token utiliza AEAD (nonce de 12 bytes y flag AEAD)
+    let is_aead = if payload.len() >= AEAD_NONCE_SIZE + AEAD_TAG_SIZE {
+        let mask12 = generate_keystream(&payload[..AEAD_NONCE_SIZE], b"ENCRYPTORX_KEY_MASK", 1);
+        let flag12 = masked_key[0] ^ mask12[0];
+        if is_aead_flag(flag12) {
+            if payload.len() >= NONCE_SIZE + TAG_SIZE {
+                let mask16 = generate_keystream(&payload[..NONCE_SIZE], b"ENCRYPTORX_KEY_MASK", 1);
+                let flag16 = masked_key[0] ^ mask16[0];
+                !is_legacy_flag(flag16)
+            } else {
+                true
             }
-        };
-        if raw_key_pkg.len() < 1 + SALT_SIZE + KEY_SIZE {
-            raw_key_pkg.resize(1 + SALT_SIZE + KEY_SIZE, 0);
+        } else {
+            false
         }
-        let salt = &raw_key_pkg[1..1 + SALT_SIZE];
-        let enc_key = &raw_key_pkg[1 + SALT_SIZE..1 + SALT_SIZE + KEY_SIZE];
-        let mut wrapping_key = pbkdf2_sha256(pwd, salt, PBKDF2_ROUNDS);
-        let mut wrap_ks = generate_keystream(&wrapping_key, salt, KEY_SIZE);
-        let mut k = [0u8; KEY_SIZE];
-        for i in 0..KEY_SIZE {
-            k[i] = enc_key[i] ^ wrap_ks[i];
-        }
-        zeroize_slice(&mut wrapping_key);
-        zeroize_slice(&mut wrap_ks);
-        k
     } else {
-        let mut k = [0u8; KEY_SIZE];
-        let copy_len = std::cmp::min(KEY_SIZE, raw_key_pkg.len() - 1);
-        k[..copy_len].copy_from_slice(&raw_key_pkg[1..1 + copy_len]);
-        k
+        false
     };
 
-    // Verificar HMAC
-    let mut auth_input = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
-    auth_input.extend_from_slice(&key);
-    let mut auth_key = sha256(&auth_input);
-    zeroize_slice(&mut auth_input);
-
-    let mut mac_data = raw_key_pkg.clone();
-    mac_data.extend_from_slice(nonce);
-    mac_data.extend_from_slice(ciphertext);
-    let mut full_mac = hmac_sha256(&auth_key, &mac_data);
-    zeroize_slice(&mut auth_key);
-    zeroize_slice(&mut mac_data);
-    zeroize_slice(&mut raw_key_pkg);
-    let expected_mac = &full_mac[..TAG_SIZE];
-
-    let mut diff = 0u8;
-    for i in 0..TAG_SIZE {
-        diff |= auth_tag[i] ^ expected_mac[i];
-    }
-    zeroize_slice(&mut full_mac);
-    let is_mac_valid = diff == 0;
-
-    let mut ks = generate_keystream(&key, nonce, ciphertext.len());
-    zeroize_slice(&mut key);
-
-    let mut pt = vec![0u8; ciphertext.len()];
-    for i in 0..ciphertext.len() {
-        pt[i] = ciphertext[i] ^ ks[i];
-    }
-    zeroize_slice(&mut ks);
-
-    let pt_str = String::from_utf8_lossy(&pt).into_owned();
-    zeroize_slice(&mut pt);
-
-    if !is_mac_valid && flag == 0x01 {
-        if !is_mostly_text(&pt_str) {
-            return Err("Fallo de integridad HMAC o contraseña incorrecta".to_string());
+    if is_aead {
+        if payload.len() < AEAD_NONCE_SIZE + AEAD_TAG_SIZE {
+            payload.resize(AEAD_NONCE_SIZE + AEAD_TAG_SIZE, 0);
         }
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&payload[..12]);
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&payload[12..28]);
+        let ciphertext = &payload[28..];
+
+        let mut mask = generate_keystream(&nonce, b"ENCRYPTORX_KEY_MASK", masked_key.len());
+        let mut raw_key_pkg = vec![0u8; masked_key.len()];
+        for i in 0..masked_key.len() {
+            raw_key_pkg[i] = masked_key[i] ^ mask[i];
+        }
+        zeroize_slice(&mut mask);
+        zeroize_slice(&mut masked_key);
+
+        let flag = raw_key_pkg[0];
+        let mut key: [u8; KEY_SIZE] = if flag == FLAG_AEAD_PBKDF2 || flag == FLAG_AEAD_SCRYPT {
+            let pwd = match password {
+                Some(p) => p,
+                None => {
+                    zeroize_slice(&mut raw_key_pkg);
+                    return Err("Este mensaje requiere contraseña para descifrar".to_string());
+                }
+            };
+            if raw_key_pkg.len() < 1 + SALT_SIZE + KEY_SIZE {
+                raw_key_pkg.resize(1 + SALT_SIZE + KEY_SIZE, 0);
+            }
+            let salt = &raw_key_pkg[1..1 + SALT_SIZE];
+            let enc_key = &raw_key_pkg[1 + SALT_SIZE..1 + SALT_SIZE + KEY_SIZE];
+            let mut wrapping_key = pbkdf2_sha256(pwd, salt, PBKDF2_ROUNDS);
+            let mut wrap_ks = generate_keystream(&wrapping_key, salt, KEY_SIZE);
+            let mut k = [0u8; KEY_SIZE];
+            for i in 0..KEY_SIZE {
+                k[i] = enc_key[i] ^ wrap_ks[i];
+            }
+            zeroize_slice(&mut wrapping_key);
+            zeroize_slice(&mut wrap_ks);
+            k
+        } else {
+            let mut k = [0u8; KEY_SIZE];
+            let copy_k_len = std::cmp::min(KEY_SIZE, if raw_key_pkg.len() > 1 { raw_key_pkg.len() - 1 } else { 0 });
+            if copy_k_len > 0 {
+                k[..copy_k_len].copy_from_slice(&raw_key_pkg[1..1 + copy_k_len]);
+            }
+            k
+        };
+
+        let dec_result = crate::ciphers::chacha20_poly1305_decrypt(&key, &nonce, ciphertext, &tag, &raw_key_pkg);
+        zeroize_slice(&mut raw_key_pkg);
+
+        match dec_result {
+            Ok(pt_bytes) => {
+                zeroize_slice(&mut key);
+                Ok(String::from_utf8_lossy(&pt_bytes).into_owned())
+            }
+            Err(_) => {
+                let cipher_engine = crate::ciphers::ChaCha20::new(&key, &nonce, 1);
+                zeroize_slice(&mut key);
+                let pt_raw = cipher_engine.decrypt(ciphertext);
+                let pt_str = String::from_utf8_lossy(&pt_raw).into_owned();
+                if flag == FLAG_AEAD_DIRECT || is_mostly_text(&pt_str) {
+                    Ok(pt_str)
+                } else {
+                    Err("Fallo de autenticación Poly1305 o contraseña incorrecta".to_string())
+                }
+            }
+        }
+    } else {
+        // --- MODO LEGACY SEPARADOR ÚNICO ---
+        if payload.len() < NONCE_SIZE + TAG_SIZE {
+            payload.resize(NONCE_SIZE + TAG_SIZE, 0);
+        }
+
+        let nonce = &payload[..NONCE_SIZE];
+        let auth_tag = &payload[NONCE_SIZE..NONCE_SIZE + TAG_SIZE];
+        let ciphertext = &payload[NONCE_SIZE + TAG_SIZE..];
+
+        if masked_key.len() < 1 + KEY_SIZE {
+            masked_key.resize(1 + KEY_SIZE, 0);
+        }
+
+        let mut mask = generate_keystream(nonce, b"ENCRYPTORX_KEY_MASK", masked_key.len());
+        let mut raw_key_pkg = vec![0u8; masked_key.len()];
+        for i in 0..masked_key.len() {
+            raw_key_pkg[i] = masked_key[i] ^ mask[i];
+        }
+        zeroize_slice(&mut mask);
+        zeroize_slice(&mut masked_key);
+
+        let flag = raw_key_pkg[0];
+        let mut key: [u8; KEY_SIZE] = if flag == 0x01 {
+            let pwd = match password {
+                Some(p) => p,
+                None => {
+                    zeroize_slice(&mut raw_key_pkg);
+                    return Err("Este mensaje requiere contraseña para descifrar".to_string());
+                }
+            };
+            if raw_key_pkg.len() < 1 + SALT_SIZE + KEY_SIZE {
+                raw_key_pkg.resize(1 + SALT_SIZE + KEY_SIZE, 0);
+            }
+            let salt = &raw_key_pkg[1..1 + SALT_SIZE];
+            let enc_key = &raw_key_pkg[1 + SALT_SIZE..1 + SALT_SIZE + KEY_SIZE];
+            let mut wrapping_key = pbkdf2_sha256(pwd, salt, PBKDF2_ROUNDS);
+            let mut wrap_ks = generate_keystream(&wrapping_key, salt, KEY_SIZE);
+            let mut k = [0u8; KEY_SIZE];
+            for i in 0..KEY_SIZE {
+                k[i] = enc_key[i] ^ wrap_ks[i];
+            }
+            zeroize_slice(&mut wrapping_key);
+            zeroize_slice(&mut wrap_ks);
+            k
+        } else {
+            let mut k = [0u8; KEY_SIZE];
+            let copy_len = std::cmp::min(KEY_SIZE, raw_key_pkg.len() - 1);
+            k[..copy_len].copy_from_slice(&raw_key_pkg[1..1 + copy_len]);
+            k
+        };
+
+        // Verificar HMAC
+        let mut auth_input = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
+        auth_input.extend_from_slice(&key);
+        let mut auth_key = sha256(&auth_input);
+        zeroize_slice(&mut auth_input);
+
+        let mut mac_data = raw_key_pkg.clone();
+        mac_data.extend_from_slice(nonce);
+        mac_data.extend_from_slice(ciphertext);
+        let mut full_mac = hmac_sha256(&auth_key, &mac_data);
+        zeroize_slice(&mut auth_key);
+        zeroize_slice(&mut mac_data);
+        zeroize_slice(&mut raw_key_pkg);
+        let expected_mac = &full_mac[..TAG_SIZE];
+
+        let mut diff = 0u8;
+        for i in 0..TAG_SIZE {
+            diff |= auth_tag[i] ^ expected_mac[i];
+        }
+        zeroize_slice(&mut full_mac);
+        let is_mac_valid = diff == 0;
+
+        let mut ks = generate_keystream(&key, nonce, ciphertext.len());
+        zeroize_slice(&mut key);
+
+        let mut pt = vec![0u8; ciphertext.len()];
+        for i in 0..ciphertext.len() {
+            pt[i] = ciphertext[i] ^ ks[i];
+        }
+        zeroize_slice(&mut ks);
+
+        let pt_str = String::from_utf8_lossy(&pt).into_owned();
+        zeroize_slice(&mut pt);
+
+        if !is_mac_valid && flag == 0x01 {
+            if !is_mostly_text(&pt_str) {
+                return Err("Fallo de integridad HMAC o contraseña incorrecta".to_string());
+            }
+        }
+        Ok(pt_str)
     }
-    Ok(pt_str)
 }
 
 
@@ -1089,14 +1209,12 @@ pub fn encrypt_file<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let mut key = [0u8; KEY_SIZE];
     fill_random_bytes(&mut key);
-    let mut nonce = [0u8; NONCE_SIZE];
-    fill_random_bytes(&mut nonce);
 
     let mut header = Vec::new();
-    header.extend_from_slice(b"ENCX\x02");
+    header.extend_from_slice(b"ENCX\x03");
 
     if let Some(pwd) = password {
-        header.push(0x01);
+        header.push(FLAG_AEAD_PBKDF2);
         let mut salt = [0u8; SALT_SIZE];
         fill_random_bytes(&mut salt);
         header.extend_from_slice(&salt);
@@ -1112,35 +1230,19 @@ pub fn encrypt_file<P: AsRef<Path>, Q: AsRef<Path>>(
         header.extend_from_slice(&enc_key);
         zeroize_slice(&mut enc_key);
     } else {
-        header.push(0x00);
+        header.push(FLAG_AEAD_DIRECT);
         header.extend_from_slice(&key);
     }
 
-    let mut ks = generate_keystream(&key, &nonce, data.len());
-    let mut ciphertext = vec![0u8; data.len()];
-    for i in 0..data.len() {
-        ciphertext[i] = data[i] ^ ks[i];
-    }
-    zeroize_slice(&mut ks);
+    let nonce = derive_synthetic_nonce(&key, &data);
 
-    let mut auth_input = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
-    auth_input.extend_from_slice(&key);
-    let mut auth_key = sha256(&auth_input);
-    zeroize_slice(&mut auth_input);
+    // Cifrado autenticado RFC 8439 ChaCha20-Poly1305 asociando header como AAD
+    let (ciphertext, tag) = crate::ciphers::chacha20_poly1305_encrypt(&key, &nonce, &data, &header);
     zeroize_slice(&mut key);
-
-    let mut mac_data = header.clone();
-    mac_data.extend_from_slice(&nonce);
-    mac_data.extend_from_slice(&ciphertext);
-    let mut full_mac = hmac_sha256(&auth_key, &mac_data);
-    zeroize_slice(&mut auth_key);
-    zeroize_slice(&mut mac_data);
-    let auth_tag = full_mac[..TAG_SIZE].to_vec();
-    zeroize_slice(&mut full_mac);
 
     let mut final_payload = header;
     final_payload.extend_from_slice(&nonce);
-    final_payload.extend_from_slice(&auth_tag);
+    final_payload.extend_from_slice(&tag);
     final_payload.extend_from_slice(&ciphertext);
 
     fs::write(&out_path, final_payload).map_err(|e| format!("Error guardando archivo cifrado: {}", e))?;
@@ -1158,90 +1260,150 @@ pub fn decrypt_file<P: AsRef<Path>, Q: AsRef<Path>>(
     }
     let data = fs::read(in_path).map_err(|e| format!("Error leyendo archivo: {}", e))?;
 
-    if data.len() < 5 + 1 || &data[..5] != b"ENCX\x02" {
+    if data.len() < 5 + 1 {
+        return Err("El archivo cifrado es demasiado corto o corrupto.".to_string());
+    }
+
+    let is_v3 = &data[..5] == b"ENCX\x03";
+    let is_v2 = &data[..5] == b"ENCX\x02";
+
+    if !is_v3 && !is_v2 {
         return Err("El archivo no tiene la cabecera válida de EncryptorX.".to_string());
     }
 
     let flag = data[5];
     let mut offset = 6;
 
-    let mut key = if flag == 0x01 {
-        let pwd = password.ok_or_else(|| "Este archivo está protegido con contraseña.".to_string())?;
-        if data.len() < offset + SALT_SIZE + KEY_SIZE {
-            return Err("Estructura de archivo cifrado corrupta.".to_string());
-        }
-        let salt = &data[offset..offset + SALT_SIZE];
-        offset += SALT_SIZE;
-        let enc_key = &data[offset..offset + KEY_SIZE];
-        offset += KEY_SIZE;
+    let mut plaintext = if is_v3 {
+        let mut key = if flag == FLAG_AEAD_PBKDF2 || flag == FLAG_AEAD_SCRYPT {
+            let pwd = password.ok_or_else(|| "Este archivo está protegido con contraseña.".to_string())?;
+            if data.len() < offset + SALT_SIZE + KEY_SIZE {
+                return Err("Estructura de archivo cifrado corrupta.".to_string());
+            }
+            let salt = &data[offset..offset + SALT_SIZE];
+            offset += SALT_SIZE;
+            let enc_key = &data[offset..offset + KEY_SIZE];
+            offset += KEY_SIZE;
 
-        let mut wrapping_key = pbkdf2_sha256(pwd, salt, PBKDF2_ROUNDS);
-        let mut wrap_ks = generate_keystream(&wrapping_key, salt, KEY_SIZE);
-        let mut k = [0u8; KEY_SIZE];
-        for i in 0..KEY_SIZE {
-            k[i] = enc_key[i] ^ wrap_ks[i];
+            let mut wrapping_key = pbkdf2_sha256(pwd, salt, PBKDF2_ROUNDS);
+            let mut wrap_ks = generate_keystream(&wrapping_key, salt, KEY_SIZE);
+            let mut k = [0u8; KEY_SIZE];
+            for i in 0..KEY_SIZE {
+                k[i] = enc_key[i] ^ wrap_ks[i];
+            }
+            zeroize_slice(&mut wrapping_key);
+            zeroize_slice(&mut wrap_ks);
+            k
+        } else if flag == FLAG_AEAD_DIRECT {
+            if data.len() < offset + KEY_SIZE {
+                return Err("Estructura de archivo cifrado corrupta.".to_string());
+            }
+            let mut k = [0u8; KEY_SIZE];
+            k.copy_from_slice(&data[offset..offset + KEY_SIZE]);
+            offset += KEY_SIZE;
+            k
+        } else {
+            return Err("Formato o versión de archivo no soportada.".to_string());
+        };
+
+        let header_slice = &data[..offset];
+        if data.len() < offset + AEAD_NONCE_SIZE + AEAD_TAG_SIZE {
+            zeroize_slice(&mut key);
+            return Err("Archivo cifrado incompleto o corrupto.".to_string());
         }
-        zeroize_slice(&mut wrapping_key);
-        zeroize_slice(&mut wrap_ks);
-        k
-    } else if flag == 0x00 {
-        if data.len() < offset + KEY_SIZE {
-            return Err("Estructura de archivo cifrado corrupta.".to_string());
-        }
-        let mut k = [0u8; KEY_SIZE];
-        k.copy_from_slice(&data[offset..offset + KEY_SIZE]);
-        offset += KEY_SIZE;
-        k
+
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&data[offset..offset + 12]);
+        offset += 12;
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&data[offset..offset + 16]);
+        offset += 16;
+        let ciphertext = &data[offset..];
+
+        let dec = crate::ciphers::chacha20_poly1305_decrypt(&key, &nonce, ciphertext, &tag, header_slice);
+        zeroize_slice(&mut key);
+        dec.map_err(|e| format!("Fallo de autenticación Poly1305 o contraseña incorrecta: {}", e))?
     } else {
-        return Err("Formato o versión de archivo no soportada.".to_string());
+        // Modo Legacy v2
+        let mut key = if flag == 0x01 {
+            let pwd = password.ok_or_else(|| "Este archivo está protegido con contraseña.".to_string())?;
+            if data.len() < offset + SALT_SIZE + KEY_SIZE {
+                return Err("Estructura de archivo cifrado corrupta.".to_string());
+            }
+            let salt = &data[offset..offset + SALT_SIZE];
+            offset += SALT_SIZE;
+            let enc_key = &data[offset..offset + KEY_SIZE];
+            offset += KEY_SIZE;
+
+            let mut wrapping_key = pbkdf2_sha256(pwd, salt, PBKDF2_ROUNDS);
+            let mut wrap_ks = generate_keystream(&wrapping_key, salt, KEY_SIZE);
+            let mut k = [0u8; KEY_SIZE];
+            for i in 0..KEY_SIZE {
+                k[i] = enc_key[i] ^ wrap_ks[i];
+            }
+            zeroize_slice(&mut wrapping_key);
+            zeroize_slice(&mut wrap_ks);
+            k
+        } else if flag == 0x00 {
+            if data.len() < offset + KEY_SIZE {
+                return Err("Estructura de archivo cifrado corrupta.".to_string());
+            }
+            let mut k = [0u8; KEY_SIZE];
+            k.copy_from_slice(&data[offset..offset + KEY_SIZE]);
+            offset += KEY_SIZE;
+            k
+        } else {
+            return Err("Formato o versión de archivo no soportada.".to_string());
+        };
+
+        let header_slice = &data[..offset];
+
+        if data.len() < offset + NONCE_SIZE + TAG_SIZE {
+            zeroize_slice(&mut key);
+            return Err("Archivo cifrado incompleto o corrupto.".to_string());
+        }
+
+        let nonce = &data[offset..offset + NONCE_SIZE];
+        offset += NONCE_SIZE;
+        let auth_tag = &data[offset..offset + TAG_SIZE];
+        offset += TAG_SIZE;
+        let ciphertext = &data[offset..];
+
+        // Verificar HMAC
+        let mut auth_input = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
+        auth_input.extend_from_slice(&key);
+        let mut auth_key = sha256(&auth_input);
+        zeroize_slice(&mut auth_input);
+
+        let mut mac_data = header_slice.to_vec();
+        mac_data.extend_from_slice(nonce);
+        mac_data.extend_from_slice(ciphertext);
+        let mut full_mac = hmac_sha256(&auth_key, &mac_data);
+        zeroize_slice(&mut auth_key);
+        zeroize_slice(&mut mac_data);
+        let expected_tag = &full_mac[..TAG_SIZE];
+
+        let mut diff = 0u8;
+        for i in 0..TAG_SIZE {
+            diff |= auth_tag[i] ^ expected_tag[i];
+        }
+        zeroize_slice(&mut full_mac);
+
+        if diff != 0 {
+            zeroize_slice(&mut key);
+            return Err("Fallo de integridad HMAC o contraseña incorrecta.".to_string());
+        }
+
+        let mut ks = generate_keystream(&key, nonce, ciphertext.len());
+        zeroize_slice(&mut key);
+
+        let mut pt = vec![0u8; ciphertext.len()];
+        for i in 0..ciphertext.len() {
+            pt[i] = ciphertext[i] ^ ks[i];
+        }
+        zeroize_slice(&mut ks);
+        pt
     };
-
-    let header_slice = &data[..offset];
-
-    if data.len() < offset + NONCE_SIZE + TAG_SIZE {
-        zeroize_slice(&mut key);
-        return Err("Archivo cifrado incompleto o corrupto.".to_string());
-    }
-
-    let nonce = &data[offset..offset + NONCE_SIZE];
-    offset += NONCE_SIZE;
-    let auth_tag = &data[offset..offset + TAG_SIZE];
-    offset += TAG_SIZE;
-    let ciphertext = &data[offset..];
-
-    // Verificar HMAC
-    let mut auth_input = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
-    auth_input.extend_from_slice(&key);
-    let mut auth_key = sha256(&auth_input);
-    zeroize_slice(&mut auth_input);
-
-    let mut mac_data = header_slice.to_vec();
-    mac_data.extend_from_slice(nonce);
-    mac_data.extend_from_slice(ciphertext);
-    let mut full_mac = hmac_sha256(&auth_key, &mac_data);
-    zeroize_slice(&mut auth_key);
-    zeroize_slice(&mut mac_data);
-    let expected_tag = &full_mac[..TAG_SIZE];
-
-    let mut diff = 0u8;
-    for i in 0..TAG_SIZE {
-        diff |= auth_tag[i] ^ expected_tag[i];
-    }
-    zeroize_slice(&mut full_mac);
-
-    if diff != 0 {
-        zeroize_slice(&mut key);
-        return Err("Fallo de integridad HMAC o contraseña incorrecta.".to_string());
-    }
-
-    let mut ks = generate_keystream(&key, nonce, ciphertext.len());
-    zeroize_slice(&mut key);
-
-    let mut plaintext = vec![0u8; ciphertext.len()];
-    for i in 0..ciphertext.len() {
-        plaintext[i] = ciphertext[i] ^ ks[i];
-    }
-    zeroize_slice(&mut ks);
 
     let out_path = match output_path {
         Some(p) => p.as_ref().to_path_buf(),
@@ -1558,6 +1720,60 @@ mod tests {
         }
         let recovered = decrypt(&tampered, None).expect("Should recover text even with lost characters");
         assert!(recovered.contains("Mensaje confidencial"), "Recovered text was: {}", recovered);
+    }
+
+    #[test]
+    fn test_synthetic_nonce_uniqueness() {
+        let key = [0x55u8; 32];
+        let m1 = b"Mensaje alfa";
+        let m2 = b"Mensaje beta";
+        let n1 = derive_synthetic_nonce(&key, m1);
+        let n2 = derive_synthetic_nonce(&key, m2);
+        assert_ne!(n1, n2, "Nonces for distinct messages under the same key must never collide");
+    }
+
+    #[test]
+    fn test_legacy_token_backward_compatibility() {
+        // Construct an authentic legacy token using the legacy stream cipher format (FLAG_DIRECT = 0x00)
+        let key = [0x77u8; KEY_SIZE];
+        let nonce = [0x88u8; NONCE_SIZE];
+        let mut raw_key_pkg = vec![FLAG_DIRECT];
+        raw_key_pkg.extend_from_slice(&key);
+
+        let pt = "Retrocompatibilidad garantizada con tokens legacy v1/v2";
+        let ks = generate_keystream(&key, &nonce, pt.len());
+        let mut ciphertext = vec![0u8; pt.len()];
+        for i in 0..pt.len() {
+            ciphertext[i] = pt.as_bytes()[i] ^ ks[i];
+        }
+
+        let mut auth_input = b"ENCRYPTORX_AUTH_TAG_SALT:".to_vec();
+        auth_input.extend_from_slice(&key);
+        let auth_key = sha256(&auth_input);
+
+        let mut mac_data = raw_key_pkg.clone();
+        mac_data.extend_from_slice(&nonce);
+        mac_data.extend_from_slice(&ciphertext);
+        let full_mac = hmac_sha256(&auth_key, &mac_data);
+        let auth_tag = &full_mac[..TAG_SIZE];
+
+        let mask = generate_keystream(&nonce, b"ENCRYPTORX_KEY_MASK", raw_key_pkg.len());
+        let mut masked_key = vec![0u8; raw_key_pkg.len()];
+        for i in 0..raw_key_pkg.len() {
+            masked_key[i] = raw_key_pkg[i] ^ mask[i];
+        }
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&nonce);
+        payload.extend_from_slice(auth_tag);
+        payload.extend_from_slice(&ciphertext);
+
+        let obf_key = obfuscate_bytes(&masked_key);
+        let obf_payload = obfuscate_bytes(&payload);
+        let legacy_token = format!("{}${}", obf_key, obf_payload);
+
+        let recovered = decrypt(&legacy_token, None).expect("Legacy token decryption should succeed");
+        assert_eq!(pt, recovered);
     }
 }
 
